@@ -220,54 +220,78 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  /** 列本机节点：profile 目录（装配真源）+ 总线名册（身份真源）对照。 */
-  const listNodes = (): { rows: (NodeRow & { rosterNodeId: string; online: boolean })[]; profilesDir: string } => {
-    const profilesDir = join(homeOf(), 'profiles')
-    let names: string[] = []
+  /** 列某个目录下的子目录名（跳过 `node_modules` 与下划线/点开头者——它们是内部物）。 */
+  const subdirs = (dir: string): string[] => {
     try {
-      names = readdirSync(profilesDir).filter((f) => {
+      return readdirSync(dir).filter((f) => {
         if (f === 'node_modules' || f.startsWith('_') || f.startsWith('.')) return false
         try {
-          return statSync(join(profilesDir, f)).isDirectory()
+          return statSync(join(dir, f)).isDirectory()
         } catch {
           return false
         }
       })
     } catch {
-      names = []
+      return []
     }
+  }
+
+  /**
+   * 列本机节点：**扫两处**，再与总线名册（身份真源）对照。
+   *
+   * ① 本实例 DSH_HOME 的 `profiles/`（与本实例**共用数据面**的节点）
+   * ② `nodesRoot` 下每个节点目录里的 `.dsh/profiles/`（**数据面独立**的节点）
+   *
+   * ⚠ **为什么必须两处都扫**：默认已改成「每节点独立 home」（2026-09-26 主人定调
+   * 「跟你共用一个 dsh，但要尽可能分离」）⇒ 只扫 ① 会让**绝大多数节点隐形**——
+   * 那是「仪器看不见」而非「节点不存在」（§5.9 规则 6 的经典形态）。
+   */
+  const listNodes = (): { rows: (NodeRow & { rosterNodeId: string; online: boolean; isolated: boolean })[]; profilesDir: string } => {
+    const mainHome = homeOf()
+    const seen = new Set<string>()
+    const rows: (NodeRow & { rosterNodeId: string; online: boolean; isolated: boolean })[] = []
     const roster = readRoster()
     const now = Date.now()
-    return {
-      profilesDir,
-      rows: names.map((n) => {
-        const hit = roster.filter((r) => matchesProfile(r.nodeId, n)).sort((a, b) => b.atMs - a.atMs)[0]
-        // 工作分区：**优先读 profile 的自描述块**（真实值），读不到才退回默认规则
-        // （`<nodesRoot>/<name>`）——后者覆盖不到自定义分区，会把「规则不覆盖」
-        // 显示成「分区不存在」（§5.9 规则 6 的经典形态）。
-        let wsPath = join(nodesRootOf(), n)
-        try {
-          const m = readNodeMeta(JSON.parse(readFileSync(join(profilesDir, n, 'package.json'), 'utf8')))
-          if (m !== undefined && m.workspace !== '') wsPath = m.workspace
-        } catch {
-          /* 读不到就用默认规则 */
-        }
-        let wsExists = false
-        try {
-          wsExists = statSync(wsPath).isDirectory()
-        } catch {
-          wsExists = false
-        }
-        return {
-          name: n,
-          profileExists: true,
-          workspaceExists: wsExists,
-          pid: hit && pidAlive(hit.pid) ? hit.pid : null,
-          rosterNodeId: hit?.nodeId ?? '',
-          online: hit !== undefined && now - hit.atMs < 60_000,
-        }
-      }),
+
+    const consider = (name: string, home: string, profileDir: string): void => {
+      if (seen.has(name)) return
+      seen.add(name)
+      // 工作分区：**优先读 profile 的自描述块**（真实值），读不到才退回默认规则
+      // （`<nodesRoot>/<name>`）——后者覆盖不到自定义分区，会把「规则不覆盖」
+      // 显示成「分区不存在」（§5.9 规则 6）。
+      let wsPath = join(nodesRootOf(), name)
+      try {
+        const m = readNodeMeta(JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8')))
+        if (m !== undefined && m.workspace !== '') wsPath = m.workspace
+      } catch {
+        /* 读不到就用默认规则 */
+      }
+      let wsExists = false
+      try {
+        wsExists = statSync(wsPath).isDirectory()
+      } catch {
+        wsExists = false
+      }
+      const hit = roster.filter((r) => matchesProfile(r.nodeId, name)).sort((a, b) => b.atMs - a.atMs)[0]
+      rows.push({
+        name,
+        profileExists: true,
+        workspaceExists: wsExists,
+        pid: hit && pidAlive(hit.pid) ? hit.pid : null,
+        rosterNodeId: hit?.nodeId ?? '',
+        online: hit !== undefined && now - hit.atMs < 60_000,
+        isolated: resolve(home) !== resolve(mainHome),
+      })
     }
+
+    for (const n of subdirs(join(mainHome, 'profiles'))) consider(n, mainHome, join(mainHome, 'profiles', n))
+    const root = nodesRootOf()
+    for (const n of subdirs(root)) {
+      const h = join(root, n, '.dsh')
+      consider(n, h, join(h, 'profiles', n))
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name))
+    return { rows, profilesDir: join(mainHome, 'profiles') }
   }
 
   // ── 工具一：node_create ─────────────────────────────────────────────────────
@@ -276,7 +300,7 @@ export function apply(ctx: Context, config: Config): void {
     description:
       '锻造一个 DSH 智能体实例：建工作分区 + 写 profile 骨架（照官方模板逐字段对齐）+ '
       + '写 cluster 配置（共用总线）+ 装 link 依赖 + 起进程。三个隔离层次互相独立——'
-      + 'profile 决定「装配」、workspace 决定「在哪干活」、home 决定「数据面」（只有 isolatedHome=true 才分家）。'
+      + 'profile 决定「装配」、workspace 决定「在哪干活」、home 决定「数据面」（**缺省各自独立**，见 isolatedHome）。'
       + 'dryRun=true 只出计划不落盘；start=false 只落盘不起进程。已存在的 profile 一律拒绝覆盖。',
     parameters: {
       name: { type: 'string', description: '节点名（= profile 名；小写字母/数字/连字符，不可撞随附 profile 或保留名）' },
@@ -284,7 +308,7 @@ export function apply(ctx: Context, config: Config): void {
       workspace: { type: 'string', description: '工作分区绝对路径（缺省 <nodesRoot>/<name>）' },
       port: { type: 'number', description: '端口（缺省 0 = 不指定）' },
       role: { type: 'string', description: '名册角色标签（缺省「执行节点」）' },
-      isolatedHome: { type: 'boolean', description: 'true = 连 DSH_HOME 一起隔离（重；用于需要身份/凭据隔离的对外节点）' },
+      isolatedHome: { type: 'boolean', description: 'DSH_HOME 是否独立（**缺省 true**：每节点一套 sessions / credentials / presets）。传 false = 与本实例共用数据面（轻，但凭据不分家）' },
       autoInject: { type: 'boolean', description: '收到消息是否自动注入会话（缺省 false：留给适配器/工具取用）。置 true 可复现「有会话才注入」的语义' },
       dryRun: { type: 'boolean', description: 'true = 只出计划，不落盘、不起进程' },
       start: { type: 'boolean', description: '落盘后是否起进程（缺省 true）' },
@@ -332,7 +356,10 @@ export function apply(ctx: Context, config: Config): void {
         trace('create-reject', { name, reason: check.reason })
         return createFail(name, '', '', busDirOf(), check.reason)
       }
-      const isolated = bool(args.isolatedHome, false)
+      // 默认**隔离**（2026-09-26 主人定调：「虽然跟你共用一个 dsh，但要尽可能分离」）：
+      // 每个节点有自己的 DSH_HOME（sessions / credentials / presets 各自独立）；
+      // **唯一仍然共享的是总线目录**——那是通信生命线，分了就互相看不见（N3）。
+      const isolated = bool(args.isolatedHome, true)
       const workspace = str(args.workspace, '').trim() !== '' ? resolve(str(args.workspace)) : join(nodesRootOf(), name)
       const home = isolated ? join(workspace, '.dsh') : homeOf()
       const harnessRoot = harnessRootOf()
@@ -519,7 +546,7 @@ export function apply(ctx: Context, config: Config): void {
           rosterNodeId: r.rosterNodeId,
           online: r.online,
           pid: r.pid ?? 0,
-          summary: describeNodeRow(r),
+          summary: describeNodeRow(r) + (r.isolated ? ' · 独立 home' : ' · 共用 home'),
         })),
       }
     },
