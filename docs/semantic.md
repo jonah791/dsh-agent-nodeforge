@@ -150,11 +150,12 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 | A5 | 所有计划文件都是 `create` 模式（N1） | **单测已验** | ✔ U；**尸体样本**：改成 `overwrite` ⇒ **1 fail** |
 | A6 | 启动形状与守护同形（`--expose-internals` / `--profile` / `--no-open`，`cwd=workspace`） | **单测已验** | ✔ U：逐位置断言 argv + `env.DSH_HOME` + `cwd` |
 | A7 | `stopGuard` 拒绝 web/watch | **单测已验** | ✔ U |
-| A8 | **线上**：`node_create` 起出的节点真的进 `cluster_nodes` 名册 | **待线上验收** | ⚠ 待线上验收（需挂载插件 + 重启 web） |
-| A9 | **线上**：新节点**无用户会话**时，收到消息落 `hold-no-session`（而非重试到 `dead`） | **待线上验收** | ⚠ 待线上验收——与 `dsh-agent-cluster` §7 E4 是**同一次验收**（该节点就是最现成的无会话样本） |
+| A8 | **线上**：`node_create` 起出的节点真的进 `cluster_nodes` 名册 | **已实测**（2026-09-26 21:25） | ✔ E：`node_create name=node-a template=web port=3090` ⇒ 名册出现 `LAPTOP-BF4IAPLM-node-a-3090 [执行节点] · 在线`——**12 天来第一次**名册里有第二个活节点；派生名（`<host>-<profile>-<port>`）与角色都对 |
+| A9 | **线上**：新节点**无用户会话**时，收到消息落 `hold-no-session`（而非重试到 `dead`） | **已实测**（2026-09-26 21:44） | ✔ E：`node-b`（`autoInject=true` + 零会话）收到 `m-muify6kr-117fc910` ⇒ **恰好 1 条** `hold-no-session`、消息留在 inbox、`attempts={}` / `failed=0` / `dead=0`。与 cluster §7 **E4 是同一次验收** |
 | A10 | 对既有 profile 再锻造一次 ⇒ 拒绝且不改动任何文件 | **待线上验收** | ⚠ 待线上验收（离线只能验计划层，落盘拒绝路径要真跑） |
 | A11 | profile 写入 `dshNodeforge` 自描述块，且 `readNodeMeta` 往返保真 | **单测已验** | ✔ U：字段逐项深度相等 + 往返。**两组尸体样本**：把读侧键名打错（读写不再一致）⇒ **2 fail**；去掉版本校验（`v=2` 也被当合法）⇒ **1 fail** |
 | A12 | `readNodeMeta` 对坏形状一律 `undefined` 且**不抛**；缺字段用安全默认 | **单测已验** | ✔ U：11 个坏样本（`null` / 数组 / `v≠1` / 非对象块 / 原始值…）全部 `undefined`；缺字段得空串 / `0` / `false`，**不伪造值**（伪造 workspace 会让 `node_start` 起错地方） |
+| A13 | **线上**：`node_start` 能起一个**已存在**的节点 | **已实测**（2026-09-26 21:43） | ✔ E：`node-a` 离线后由 `node_start` 拉起（pid 26468 · 3090 监听 · 名册回在线）。⚠ **同时暴露一个真缺陷**：对**无自描述块**的 profile，`node_start` 会**丢端口** ⇒ 落到 app 默认端口（3080 已被主 web 占）⇒ 进程起来后**立刻死**，症状是「进程起来了但名册里没有」（与 `--no-open` 同族）。**显式传 `port` 即恢复**，已当场验证。见 U6 |
 
 ## 8. 与实现的关系
 
@@ -180,3 +181,4 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 - **U3 workspace 真源 → 已关闭（2026-09-26）**：`node_list` 现在**优先读 profile 的自描述块** `dshNodeforge.workspace`（真实值），读不到才退回默认规则——「自定义分区被显示成『无工作分区』」这一形态随之消失。**残留**：手工造的 profile（无该块）仍走默认规则，那是**有意的降级**而非缺陷。
 - **U4 模板面偏窄**：只支持 `headless` 与 `sdk`（均为不依赖自研插件栈的随附模板）。要造「像 web 一样带完整自研栈」的节点，需要额外的 bundle 列表来源——但那条路会把主脑的器官复制到执行节点上，**先问清需求再做**。
 - **U5 依赖安装的耗时与失败面**：`pnpm install` 串在锻造路径里（超时 120s，失败只告警不中止）。若将来批量造节点，应考虑「先建全部 profile、再并发装依赖」。
+- **U6 无自描述块的老 profile：`node_start` 会丢端口（2026-09-26 实测发现）**：自描述块是**分批上线**的，**先造后加**的 profile（如 `node-a`：21:25 造，而 meta 功能 21:36 才有）没有 `dshNodeforge` 块 ⇒ 三级回退（显式参数 > 自描述块 > 默认规则）里 `port` 只能落到 `0`（**不传 `--port`**）⇒ web app 用默认端口（**3080，已被主 web 占用**）⇒ 进程**起得来但立刻死**，症状是「进程起来了，名册里却没有」——与 `--no-open` 那个坑**同族**。当场验证：显式传 `port: 3090` 即恢复（pid 26468 · 3090 监听 · 名册回在线）。**候选修法**：① 最简——`note` 里对「无 meta」情形**响亮警告端口风险**（当前只说「元信息来源：默认规则」，语气太轻）；② 更稳——`node_start` 加一步「**回填**自描述块」（读不到 meta 时按实际使用的参数补写一次，让 profile **自愈**成自描述）；③ 治本——把端口写进**与 profile 解耦的位置**（如 workspace 里的标记文件）。**倾向 ②**：它同时解决「老 profile 永久缺信息」与「每次起都要人记端口」。
