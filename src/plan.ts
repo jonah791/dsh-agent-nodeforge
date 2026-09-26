@@ -19,11 +19,30 @@ export const SHIPPED_PROFILES = ['web', 'headless', 'sdk', 'sdk-minimal', 'acp']
 /** 保留名：即使不在随附列表中也不许占用（`desktop` 归 Electron；`watch` 是本机守护）。 */
 export const RESERVED_NAMES = ['desktop', 'watch'] as const
 
-/** 随附模板 → 它的 bundle 列表（照官方模板复制；只收**不依赖自研插件栈**的模板）。 */
+/** 随附模板 → 它的 bundle 列表。 */
 export const TEMPLATE_BUNDLES: Record<string, readonly string[]> = {
+  // ⚠ 包名是**实测**来的（2026-09-26 用独立 `DSH_HOME` 跑
+  // `--from-default-profile <t> --dump-config` 读回它生成的 manifest），不是猜的——
+  // 初版把 sdk 写成 `@deepseek-ai/dsh-sdk` 就是猜错的（真值 `dsh-sdk-app`）。
+  //
+  // ⚠ **形态差异（同样实测）**：`headless` **要一个任务、跑完即退**（one-shot），
+  // **不能当常驻节点**——带上它起出来的「节点」会打印
+  // `dsh: a task is required` 然后消失，名册里什么都不留。
+  // `web` / `sdk` / `acp` 是常驻型 ⇒ 默认用 `web`（见 `index.ts` 的 `node_create`）。
+  web: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
+  sdk: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-sdk-app'],
+  acp: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-acp-app'],
   headless: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'],
-  sdk: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-sdk'],
 }
+
+/**
+ * 认识 `--no-open` 的模板。
+ *
+ * `--no-open` 是 **web app 自己的**参数（控制是否自动开浏览器）；其它 app 不认它——
+ * 2026-09-26 实测，误会它的后果是 `error: unknown option '--no-open'`，进程**起得来但秒退**，
+ * 名册里什么都不留（症状极像「插件没生效」，极难归因）。⇒ 只在该 app 确实认识时才加。
+ */
+export const TEMPLATE_ACCEPTS_NO_OPEN: readonly string[] = ['web']
 
 /** 节点规格（调用方给全，本模块不读环境）。 */
 export interface NodeSpec {
@@ -134,6 +153,21 @@ export function planNode(spec: NodeSpec): NodePlan {
     // 依赖只有 cluster 插件一条 **link**（bundle 本身是 in-box，从 dsh 安装目录解析，不需要装）。
     dependencies: { 'dsh-agent-cluster': 'link:' + spec.clusterPluginPath },
     dsh: { profile: { bundles: bundleList } },
+    // ── 自描述块（本插件的约定；照官方 `dshTavern` 自定义键的先例）──────────────────
+    // 为什么要有它：① `node_start` 要起一个**已存在**的节点，就得知道该带哪些 app 参数
+    // （`--no-open` 只有 web 认，带错就秒退）② `node_list` 要报**真实** workspace，
+    // 而不是按默认规则猜（猜不到自定义分区，会把「规则不覆盖」显示成「分区不存在」）。
+    // 把这些写进 profile 自己 ⇒ 起/查都不必让调用方重复输入，也不会与实际漂移。
+    dshNodeforge: {
+      v: 1,
+      template: spec.template,
+      workspace: spec.workspace,
+      port: spec.port,
+      role: spec.role,
+      busDir: spec.busDir,
+      home: spec.home,
+      autoInject: spec.autoInject,
+    },
   }
 
   const patchYml = [
@@ -175,7 +209,10 @@ export function planNode(spec: NodeSpec): NodePlan {
     '--profile',
     spec.name,
     ...(spec.port > 0 ? ['--port', String(spec.port)] : []),
-    '--no-open',
+    // ⚠ `--no-open` 是 **web app 自己的**参数（控制是否自动开浏览器）——headless 不认它。
+    // 2026-09-26 实测：带上它 ⇒ `error: unknown option '--no-open'`，进程**起得来但秒退**，
+    // 名册里什么都不留（症状极像「插件没生效」）。⇒ 只在该 app 确实认识时才加。
+    ...(TEMPLATE_ACCEPTS_NO_OPEN.includes(spec.template) ? ['--no-open'] : []),
   ]
 
   return {
@@ -190,6 +227,45 @@ export function planNode(spec: NodeSpec): NodePlan {
       },
     },
     warnings,
+  }
+}
+
+/** profile 的自描述块（本插件写、本插件读；形状见 `planNode` 里的 `dshNodeforge`）。 */
+export interface NodeMeta {
+  v: 1
+  template: string
+  workspace: string
+  port: number
+  role: string
+  busDir: string
+  home: string
+  autoInject: boolean
+}
+
+/**
+ * 从 profile 的 `package.json` 原始值里读出自描述块。
+ *
+ * **never throws**：形状不对 ⇒ 返回 `undefined`，调用方据此**回退到默认规则**——
+ * 不能因为读不到元信息就让节点起不来（那是把「信息缺失」升级成「功能失效」）。
+ * @param raw - `JSON.parse` 后的未知值
+ */
+export function readNodeMeta(raw: unknown): NodeMeta | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const block = (raw as Record<string, unknown>)['dshNodeforge']
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) return undefined
+  const o = block as Record<string, unknown>
+  if (o['v'] !== 1) return undefined
+  const s = (k: string): string => (typeof o[k] === 'string' ? (o[k] as string) : '')
+  const n = (k: string): number => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : 0)
+  return {
+    v: 1,
+    template: s('template'),
+    workspace: s('workspace'),
+    port: n('port'),
+    role: s('role'),
+    busDir: s('busDir'),
+    home: s('home'),
+    autoInject: o['autoInject'] === true,
   }
 }
 

@@ -11,7 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import {
-  SHIPPED_PROFILES, TEMPLATE_BUNDLES, describeNodeRow, planNode, stopGuard, validateNodeName, yamlQuote,
+  SHIPPED_PROFILES, TEMPLATE_BUNDLES, describeNodeRow, planNode, readNodeMeta, stopGuard, validateNodeName, yamlQuote,
 } from '../lib/plan.js'
 
 const require = createRequire(import.meta.url)
@@ -146,13 +146,15 @@ test('planNode：port>0 时 patch 与 cmd 都带上端口', () => {
   assert.equal(cmd[cmd.indexOf('--port') + 1], '3081')
 })
 
-test('planNode：启动形状与已验证的守护实现同形（--expose-internals / --profile / --no-open，cwd=workspace）', () => {
+test('planNode：启动形状与已验证的守护实现同形（--expose-internals / --profile，cwd=workspace）', () => {
   const spec = mkSpec()
   const { launch } = planNode(spec)
   assert.equal(launch.cmd[1], '--expose-internals')
   assert.ok(launch.cmd[2]?.endsWith('bin.js'), 'argv[2] 应是 launcher：' + String(launch.cmd[2]))
   assert.equal(launch.cmd[launch.cmd.indexOf('--profile') + 1], 'node-a')
-  assert.ok(launch.cmd.includes('--no-open'))
+  // ⚠ 反向断言：headless 模板**不得**带 `--no-open`——它不认这个参数，会 unknown option 秒退。
+  // 这条断言曾经写反（要求存在），等于把一个真实崩溃锁进了绿灯（2026-09-26 实测修正）。
+  assert.ok(!launch.cmd.includes('--no-open'), 'headless 不该带 --no-open：' + launch.cmd.join(' '))
   assert.equal(launch.cwd, spec.workspace, 'cwd 必须是工作分区')
   assert.equal(launch.env.DSH_HOME, spec.home)
 })
@@ -166,6 +168,26 @@ test('planNode：未知模板 ⇒ 发出可诊断告警且不抛（纯层不出�
   const plan = planNode(mkSpec({ template: 'nope' }))
   assert.ok(plan.warnings.length > 0, '应告警')
   assert.ok(plan.warnings[0]?.includes('nope'), '告警应点出模板名：' + String(plan.warnings[0]))
+})
+
+// ── 模板形态（实测语义：谁常驻、谁认识 --no-open） ─────────────────────────────
+
+test('模板真值：四个随附模板的 bundle 包名与官方 manifest 逐字一致', () => {
+  // 包名是从 `--from-default-profile <t> --dump-config` 读回来的**真值**，不是猜的。
+  // 初版曾把 sdk 写成 '@deepseek-ai/dsh-sdk'（真值 dsh-sdk-app）——猜出来的包名会让节点起不来。
+  assert.deepEqual(TEMPLATE_BUNDLES.web, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+  assert.deepEqual(TEMPLATE_BUNDLES.sdk, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-sdk-app'])
+  assert.deepEqual(TEMPLATE_BUNDLES.acp, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-acp-app'])
+  assert.deepEqual(TEMPLATE_BUNDLES.headless, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'])
+})
+
+test('--no-open 只对 web 模板加：其它 app 不认它，带上会 unknown option 秒退', () => {
+  const web = planNode(mkSpec({ template: 'web' })).launch.cmd
+  assert.ok(web.includes('--no-open'), 'web 该带 --no-open：' + web.join(' '))
+  for (const t of ['headless', 'sdk', 'acp']) {
+    const cmd = planNode(mkSpec({ template: t })).launch.cmd
+    assert.ok(!cmd.includes('--no-open'), t + ' 不该带 --no-open：' + cmd.join(' '))
+  }
 })
 
 // ── stopGuard / describeNodeRow ──────────────────────────────────────────────
@@ -187,4 +209,48 @@ test('describeNodeRow：运行态 / 缺失态都说清楚', () => {
   assert.ok(describeNodeRow({ name: 'x', profileExists: true, workspaceExists: true, pid: 123 }).includes('pid=123'))
   const missing = describeNodeRow({ name: 'x', profileExists: false, workspaceExists: false, pid: null })
   assert.ok(missing.includes('无 profile') && missing.includes('无工作分区') && missing.includes('未运行'))
+})
+
+// ── 自描述块（profile 自己记住「我是怎么被造的」）─────────────────────────────
+// 为什么要它：`node_start` 要起一个**已存在**的节点就得知道该带哪些 app 参数
+// （`--no-open` 只有 web 认，带错就秒退）；`node_list` 要报**真实** workspace 而不是猜。
+
+test('planNode：package.json 写入 dshNodeforge 自描述块，字段逐项保真', () => {
+  const spec = mkSpec({ template: 'web', port: 3090, autoInject: true })
+  const pkg = JSON.parse(fileOf(planNode(spec), 'package.json'))
+  assert.deepEqual(pkg.dshNodeforge, {
+    v: 1,
+    template: 'web',
+    workspace: spec.workspace,
+    port: 3090,
+    role: spec.role,
+    busDir: spec.busDir,
+    home: spec.home,
+    autoInject: true,
+  })
+})
+
+test('readNodeMeta：往返保真（写进去的能读回来）', () => {
+  const spec = mkSpec({ template: 'web', port: 3090 })
+  const meta = readNodeMeta(JSON.parse(fileOf(planNode(spec), 'package.json')))
+  assert.equal(meta.template, 'web')
+  assert.equal(meta.port, 3090)
+  assert.equal(meta.workspace, spec.workspace)
+  assert.equal(meta.busDir, spec.busDir)
+})
+
+test('readNodeMeta：坏形状一律 undefined 且**不抛**（never throws）', () => {
+  // 读不到元信息只该让调用方**退回默认规则**，绝不能升级成「节点起不来」。
+  for (const bad of [null, undefined, 42, 'x', [], {}, { dshNodeforge: null }, { dshNodeforge: [] },
+    { dshNodeforge: 'x' }, { dshNodeforge: { v: 2 } }, { dshNodeforge: { v: '1' } }]) {
+    assert.equal(readNodeMeta(bad), undefined, '坏样本应得 undefined：' + JSON.stringify(bad))
+  }
+})
+
+test('readNodeMeta：缺字段用安全默认（空串 / 0 / false），**不伪造值**', () => {
+  const m = readNodeMeta({ dshNodeforge: { v: 1, template: 'web' } })
+  assert.equal(m.template, 'web')
+  assert.equal(m.workspace, '', '缺 workspace 应是空串——伪造一个默认路径会让 node_start 起错地方')
+  assert.equal(m.port, 0)
+  assert.equal(m.autoInject, false)
 })

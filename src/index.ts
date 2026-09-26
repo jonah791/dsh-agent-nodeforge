@@ -20,7 +20,7 @@ import { homedir, hostname as osHostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  describeNodeRow, planNode, stopGuard, validateNodeName,
+  describeNodeRow, planNode, readNodeMeta, stopGuard, validateNodeName,
   SHIPPED_PROFILES, TEMPLATE_BUNDLES, type NodeRow, type NodeSpec,
 } from './plan.ts'
 
@@ -63,6 +63,7 @@ interface ToolArgs {
   port?: unknown
   role?: unknown
   isolatedHome?: unknown
+  autoInject?: unknown
   dryRun?: unknown
   start?: unknown
 }
@@ -241,11 +242,19 @@ export function apply(ctx: Context, config: Config): void {
       profilesDir,
       rows: names.map((n) => {
         const hit = roster.filter((r) => matchesProfile(r.nodeId, n)).sort((a, b) => b.atMs - a.atMs)[0]
-        // 工作分区按**默认规则**探测（`<nodesRoot>/<name>`）。自定义 workspace 的节点
-        // 这里会显示 false——那是**规则不覆盖**，不是「分区不存在」（§5.9 规则 6）。
+        // 工作分区：**优先读 profile 的自描述块**（真实值），读不到才退回默认规则
+        // （`<nodesRoot>/<name>`）——后者覆盖不到自定义分区，会把「规则不覆盖」
+        // 显示成「分区不存在」（§5.9 规则 6 的经典形态）。
+        let wsPath = join(nodesRootOf(), n)
+        try {
+          const m = readNodeMeta(JSON.parse(readFileSync(join(profilesDir, n, 'package.json'), 'utf8')))
+          if (m !== undefined && m.workspace !== '') wsPath = m.workspace
+        } catch {
+          /* 读不到就用默认规则 */
+        }
         let wsExists = false
         try {
-          wsExists = statSync(join(nodesRootOf(), n)).isDirectory()
+          wsExists = statSync(wsPath).isDirectory()
         } catch {
           wsExists = false
         }
@@ -271,11 +280,12 @@ export function apply(ctx: Context, config: Config): void {
       + 'dryRun=true 只出计划不落盘；start=false 只落盘不起进程。已存在的 profile 一律拒绝覆盖。',
     parameters: {
       name: { type: 'string', description: '节点名（= profile 名；小写字母/数字/连字符，不可撞随附 profile 或保留名）' },
-      template: { type: 'string', description: '随附模板：headless（缺省）| sdk' },
+      template: { type: 'string', description: '随附模板：web（缺省·常驻）| sdk | acp | headless（one-shot，跑完即退，不适合当节点）' },
       workspace: { type: 'string', description: '工作分区绝对路径（缺省 <nodesRoot>/<name>）' },
       port: { type: 'number', description: '端口（缺省 0 = 不指定）' },
       role: { type: 'string', description: '名册角色标签（缺省「执行节点」）' },
       isolatedHome: { type: 'boolean', description: 'true = 连 DSH_HOME 一起隔离（重；用于需要身份/凭据隔离的对外节点）' },
+      autoInject: { type: 'boolean', description: '收到消息是否自动注入会话（缺省 false：留给适配器/工具取用）。置 true 可复现「有会话才注入」的语义' },
       dryRun: { type: 'boolean', description: 'true = 只出计划，不落盘、不起进程' },
       start: { type: 'boolean', description: '落盘后是否起进程（缺省 true）' },
     },
@@ -334,14 +344,16 @@ export function apply(ctx: Context, config: Config): void {
 
       const spec: NodeSpec = {
         name,
-        template: str(args.template, '').trim() !== '' ? str(args.template) : 'headless',
+        // 默认 `web`：**常驻型**。`headless` 是 one-shot（要任务、跑完即退），
+        // 拿它当节点 ⇒ 进程打印 `dsh: a task is required` 后消失（2026-09-26 实测）。
+        template: str(args.template, '').trim() !== '' ? str(args.template) : 'web',
         workspace,
         harnessRoot,
         home,
         busDir: busDirOf(),
         role: str(args.role, '').trim() !== '' ? str(args.role) : '执行节点',
         port: num(args.port, 0),
-        autoInject: false,
+        autoInject: bool(args.autoInject, false),
         clusterPluginPath: clusterPathOf(),
       }
       const plan = planNode(spec)
@@ -376,7 +388,9 @@ export function apply(ctx: Context, config: Config): void {
         const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
         try {
           await new Promise<void>((res, rej) => {
-            const child = execFile(pnpm, ['install', '--silent'], { cwd: profileDir, timeout: config.installTimeoutMs }, (err) => {
+            // `shell: true` 是 Windows 必需：execFile 直接跑 `.cmd` 会 `spawn EINVAL`
+            // （2026-09-26 实测）。参数全是本模块写死的常量，**无注入面**。
+            const child = execFile(pnpm, ['install', '--silent'], { cwd: profileDir, timeout: config.installTimeoutMs, shell: true }, (err) => {
               if (err) rej(err)
               else res()
             })
@@ -565,11 +579,138 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  // ── 工具四：node_start ──────────────────────────────────────────────────────
+  const startTool: ToolDefinition = defineTool({
+    name: 'node_start',
+    description:
+      '起一个**已存在**的节点（profile 已在盘上）。`node_create` 只造新节点且拒绝覆盖既有 profile，'
+      + '所以「停掉之后想再起」必须靠这个工具。参数缺省时读 profile 的自描述块 `dshNodeforge`'
+      + '（template / workspace / port / home / busDir），因此正常情况下只需给 name。'
+      + '**不写任何文件**，只起进程；profile 不存在 ⇒ 明确拒绝并提示改用 node_create。',
+    parameters: {
+      name: { type: 'string', description: '节点名（= profile 名）' },
+      port: { type: 'number', description: '覆盖端口（缺省用自描述块里的值；0 = 不指定）' },
+      workspace: { type: 'string', description: '覆盖工作分区（缺省用自描述块里的值，再退回默认规则）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          name: { type: 'string', required: true },
+          pid: { type: 'number', required: true },
+          workspace: { type: 'string', required: true },
+          cmd: { type: 'string', required: true },
+          note: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value: any) => {
+        const v = value as Record<string, unknown>
+        return [{
+          type: 'text',
+          text: (v['ok'] ? '已起 ' : '未起 ') + String(v['name'])
+            + (Number(v['pid']) > 0 ? ' (pid=' + String(v['pid']) + ')' : '')
+            + '\n  cwd ' + String(v['workspace'])
+            + '\n  cmd ' + String(v['cmd'])
+            + '\n' + String(v['note']),
+        }]
+      },
+    },
+    async execute(args: ToolArgs) {
+      const name = str(args.name, '').trim()
+      const check = validateNodeName(name)
+      if (!check.ok) {
+        trace('start-reject', { name, reason: check.reason })
+        return { ok: false, name, pid: 0, workspace: '', cmd: '', note: check.reason }
+      }
+      const profileDir = join(homeOf(), 'profiles', name)
+      if (!existsSync(profileDir)) {
+        const note = 'profile 不存在（' + profileDir + '）——这是**没造过**的节点，改用 node_create。'
+        trace('start-reject', { name, reason: 'no-profile' })
+        return { ok: false, name, pid: 0, workspace: '', cmd: '', note }
+      }
+      // 读自描述块：读不到就退回默认规则（**不把「信息缺失」升级成「功能失效」**）
+      let meta: ReturnType<typeof readNodeMeta>
+      try {
+        meta = readNodeMeta(JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8')))
+      } catch {
+        meta = undefined
+      }
+      const harnessRoot = harnessRootOf()
+      if (harnessRoot === '') {
+        return { ok: false, name, pid: 0, workspace: '', cmd: '', note: '推不出 harnessRoot（argv[1] 形状不符且未配置 config.harnessRoot）' }
+      }
+      // 三级回退：显式参数 > profile 自描述 > 本机默认规则
+      const workspace = str(args.workspace, '').trim() !== ''
+        ? resolve(str(args.workspace))
+        : (meta !== undefined && meta.workspace !== '' ? meta.workspace : join(nodesRootOf(), name))
+      const spec: NodeSpec = {
+        name,
+        template: meta !== undefined && meta.template !== '' ? meta.template : 'web',
+        workspace,
+        harnessRoot,
+        home: meta !== undefined && meta.home !== '' ? meta.home : homeOf(),
+        busDir: meta !== undefined && meta.busDir !== '' ? meta.busDir : busDirOf(),
+        role: meta?.role ?? '',
+        port: num(args.port, meta?.port ?? 0),
+        autoInject: meta?.autoInject ?? false,
+        clusterPluginPath: clusterPathOf(),
+      }
+      const plan = planNode(spec)
+      try {
+        mkdirSync(spec.workspace, { recursive: true })
+      } catch (e) {
+        return { ok: false, name, pid: 0, workspace, cmd: '', note: '工作分区不可用：' + String(e) }
+      }
+      let logFd: number | undefined
+      try {
+        logFd = openSync(join(spec.workspace, '.nodeforge.log'), 'a')
+      } catch {
+        logFd = undefined
+      }
+      try {
+        const child = spawn(plan.launch.cmd[0] ?? 'node', plan.launch.cmd.slice(1), {
+          cwd: plan.launch.cwd,
+          env: { ...process.env, ...plan.launch.env },
+          stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
+          detached: true,
+        })
+        child.on('error', (err) => {
+          trace('spawn-error', { name, error: String(err) })
+        })
+        child.unref()
+        const pid = child.pid ?? 0
+        trace('started', { name, pid, fromMeta: meta !== undefined, cmd: plan.launch.cmd.join(' ') })
+        return {
+          ok: true, name, pid, workspace,
+          cmd: plan.launch.cmd.join(' '),
+          note: '元信息来源：' + (meta !== undefined
+            ? 'profile 自描述块'
+            : '默认规则（该 profile 无 dshNodeforge 块——可能是手工造的）')
+            + '。心跳一个周期内出现在 cluster_nodes；日志见 ' + join(workspace, '.nodeforge.log'),
+        }
+      } catch (e) {
+        trace('start-throw', { name, error: String(e) })
+        return { ok: false, name, pid: 0, workspace, cmd: plan.launch.cmd.join(' '), note: '起进程抛错：' + String(e) }
+      } finally {
+        if (logFd !== undefined) {
+          try {
+            closeSync(logFd)
+          } catch {
+            /* 关不掉不影响结论 */
+          }
+        }
+      }
+    },
+  })
+
   ctx.effect(() => {
     guarded('register', () => {
       ctx.tools.register(createTool)
       ctx.tools.register(listTool)
       ctx.tools.register(stopTool)
+      ctx.tools.register(startTool)
     })
     trace('startup', {
       home: homeOf(), busDir: busDirOf(), nodesRoot: nodesRootOf(),
