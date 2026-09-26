@@ -432,42 +432,19 @@ export function apply(ctx: Context, config: Config): void {
         warnings.push(wrote.refused.length > 0 ? '有文件已存在 ⇒ 未覆盖、未安装依赖' : '有写入错误 ⇒ 未安装依赖')
       }
 
-      // ④ 起进程（detached + stdio 落文件：不占宿主 fd，且子进程活过宿主）
+      // ④ 起进程 —— 经**孤儿化启动器**转手（见 `scripts/spawn-detached.mjs` 头注：
+      // 直接 spawn 的子进程会被守护的 `taskkill /T`（杀整棵进程树）连带杀掉；
+      // 经一个自灭的中间层转手后链就断了——对照实验已证：同一次 taskkill 下
+      // 直接子进程死、经中间层转手的活）。
       let pid = 0
       if (bool(args.start, true) && wrote.errors.length === 0 && wrote.refused.length === 0) {
-        const logPath = join(spec.workspace, '.nodeforge.log')
-        let logFd: number | undefined
-        try {
-          logFd = openSync(logPath, 'a')
-        } catch {
-          logFd = undefined
-        }
-        try {
-          const child = spawn(plan.launch.cmd[0] ?? 'node', plan.launch.cmd.slice(1), {
-            cwd: plan.launch.cwd,
-            env: { ...process.env, ...plan.launch.env },
-            stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
-            detached: true,
-          })
-          // 必挂 error：spawn 异步失败（ENOENT/EPERM）不监听会掀掉宿主（§5.24）。
-          child.on('error', (err) => {
-            trace('spawn-error', { name, error: String(err) })
-          })
-          child.unref()
-          pid = child.pid ?? 0
-          trace('create-started', { name, pid, cmd: plan.launch.cmd.join(' ') })
-        } catch (e) {
-          warnings.push('起进程抛错：' + String(e))
-          trace('spawn-throw', { name, error: String(e) })
-        } finally {
-          // 父进程侧关掉副本——否则每次锻造泄一个 fd。
-          if (logFd !== undefined) {
-            try {
-              closeSync(logFd)
-            } catch {
-              /* 关不掉不影响结论 */
-            }
-          }
+        const r = spawnDetached(plan.launch.cmd, plan.launch.cwd, plan.launch.env, join(spec.workspace, '.nodeforge.log'))
+        if (r.ok) {
+          pid = r.pid
+          trace('create-started', { name, launcherPid: r.pid, orphan: true, cmd: plan.launch.cmd.join(' ') })
+        } else {
+          warnings.push('起进程失败：' + String(r.error))
+          trace('spawn-fail', { name, error: String(r.error) })
         }
       }
 
@@ -690,47 +667,59 @@ export function apply(ctx: Context, config: Config): void {
       } catch (e) {
         return { ok: false, name, pid: 0, workspace, cmd: '', note: '工作分区不可用：' + String(e) }
       }
-      let logFd: number | undefined
-      try {
-        logFd = openSync(join(spec.workspace, '.nodeforge.log'), 'a')
-      } catch {
-        logFd = undefined
-      }
-      try {
-        const child = spawn(plan.launch.cmd[0] ?? 'node', plan.launch.cmd.slice(1), {
-          cwd: plan.launch.cwd,
-          env: { ...process.env, ...plan.launch.env },
-          stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
-          detached: true,
-        })
-        child.on('error', (err) => {
-          trace('spawn-error', { name, error: String(err) })
-        })
-        child.unref()
-        const pid = child.pid ?? 0
-        trace('started', { name, pid, fromMeta: meta !== undefined, cmd: plan.launch.cmd.join(' ') })
-        return {
-          ok: true, name, pid, workspace,
-          cmd: plan.launch.cmd.join(' '),
-          note: '元信息来源：' + (meta !== undefined
+      const r = spawnDetached(plan.launch.cmd, plan.launch.cwd, plan.launch.env, join(spec.workspace, '.nodeforge.log'))
+      trace('started', { name, launcherPid: r.pid, orphan: true, fromMeta: meta !== undefined, cmd: plan.launch.cmd.join(' ') })
+      return {
+        ok: r.ok, name, pid: r.pid, workspace,
+        cmd: plan.launch.cmd.join(' '),
+        note: (r.ok ? '已**孤儿化**启动。' : '起进程失败：' + String(r.error) + '。')
+          + '元信息来源：' + (meta !== undefined
             ? 'profile 自描述块'
             : '默认规则（该 profile 无 dshNodeforge 块——可能是手工造的）')
-            + '。心跳一个周期内出现在 cluster_nodes；日志见 ' + join(workspace, '.nodeforge.log'),
-        }
-      } catch (e) {
-        trace('start-throw', { name, error: String(e) })
-        return { ok: false, name, pid: 0, workspace, cmd: plan.launch.cmd.join(' '), note: '起进程抛错：' + String(e) }
-      } finally {
-        if (logFd !== undefined) {
-          try {
-            closeSync(logFd)
-          } catch {
-            /* 关不掉不影响结论 */
-          }
-        }
+          + '。⚠ 返回的 pid 是**启动器**的（它约 150ms 后自灭）——**真节点的 pid 请在一个心跳周期后从 `cluster_nodes` 读**。日志见 ' + join(workspace, '.nodeforge.log'),
       }
     },
   })
+
+  /**
+   * 孤儿化启动器路径：`<插件>/scripts/spawn-detached.mjs`。
+   * 为什么经它转手：见该脚本头注——直接 spawn 的子进程会被守护的
+   * `taskkill /T`（杀整棵进程树）**连带杀掉**（实测：web 重启后节点一起消失）。
+   */
+  const launcherPath = (): string => resolve(selfDir, '..', 'scripts', 'spawn-detached.mjs')
+
+  /**
+   * 起一个**孤儿**进程（不在本进程的进程树里）。
+   * @param cmd - 真命令 argv
+   * @param cwd - 工作分区
+   * @param env - 追加环境变量（与 `process.env` 合并后交给真进程）
+   * @param logPath - 真进程 stdout/stderr 的落点（由启动器打开）
+   * @returns `ok` 与**启动器的 pid**——⚠ **不是真节点的 pid**：启动器约 150ms 后自灭，
+   *   真 pid 要等心跳落盘后从 `cluster_nodes` 读
+   */
+  const spawnDetached = (
+    cmd: string[], cwd: string, env: Record<string, string>, logPath: string,
+  ): { ok: boolean; pid: number; error?: string } => {
+    const launcher = launcherPath()
+    if (!existsSync(launcher)) return { ok: false, pid: 0, error: '启动器缺失：' + launcher }
+    if (cmd.length === 0) return { ok: false, pid: 0, error: '空命令' }
+    try {
+      const child = spawn(process.execPath, [launcher, logPath, '--', ...cmd], {
+        cwd,
+        env: { ...process.env, ...env },
+        detached: true,
+        stdio: ['ignore', 'ignore', 'ignore'],
+      })
+      // 必挂 error：spawn 异步失败（ENOENT/EPERM）不监听会掀掉宿主（§5.24）。
+      child.on('error', (err) => {
+        trace('launcher-error', { error: String(err) })
+      })
+      child.unref()
+      return { ok: true, pid: child.pid ?? 0 }
+    } catch (e) {
+      return { ok: false, pid: 0, error: String(e) }
+    }
+  }
 
   ctx.effect(() => {
     guarded('register', () => {
