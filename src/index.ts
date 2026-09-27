@@ -20,7 +20,8 @@ import { homedir, hostname as osHostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  describeNodeRow, planNode, readNodeMeta, stopGuard, validateNodeName,
+  describeNodeRow, homeOfProfile, pickProfileDir, planNode, profileDirCandidates, readNodeMeta, stopGuard,
+  validateNodeName, workspaceOfHome,
   SHIPPED_PROFILES, TEMPLATE_BUNDLES, type NodeRow, type NodeSpec,
 } from './plan.ts'
 
@@ -588,9 +589,12 @@ export function apply(ctx: Context, config: Config): void {
     name: 'node_start',
     description:
       '起一个**已存在**的节点（profile 已在盘上）。`node_create` 只造新节点且拒绝覆盖既有 profile，'
-      + '所以「停掉之后想再起」必须靠这个工具。参数缺省时读 profile 的自描述块 `dshNodeforge`'
-      + '（template / workspace / port / home / busDir），因此正常情况下只需给 name。'
-      + '**不写任何文件**，只起进程；profile 不存在 ⇒ 明确拒绝并提示改用 node_create。',
+      + '所以「停掉之后想再起」必须靠这个工具。**先在各个数据面里定位 profile**'
+      + '（共享 home + 独立 home 的默认布局 + `nodesRoot` 下的分区），不假设它和本实例共用一个 home——'
+      + '`isolatedHome=true` 的节点 profile 在它自己的数据面下，按共享 home 拼路径会把它误报成「没造过」。'
+      + '数据面出处三级：自描述块 `dshNodeforge.home` > 从已定位的 profile 目录反推 > 本实例共享 home。'
+      + '参数缺省时读自描述块（template / workspace / port / home / busDir），因此正常情况下只需给 name。'
+      + '**不写任何文件**，只起进程；profile 真的不存在 ⇒ 明确拒绝（并列出探测过的数据面）提示改用 node_create。',
     parameters: {
       name: { type: 'string', description: '节点名（= profile 名）' },
       port: { type: 'number', description: '覆盖端口（缺省用自描述块里的值；0 = 不指定）' },
@@ -628,10 +632,21 @@ export function apply(ctx: Context, config: Config): void {
         trace('start-reject', { name, reason: check.reason })
         return { ok: false, name, pid: 0, workspace: '', cmd: '', note: check.reason }
       }
-      const profileDir = join(homeOf(), 'profiles', name)
-      if (!existsSync(profileDir)) {
-        const note = 'profile 不存在（' + profileDir + '）——这是**没造过**的节点，改用 node_create。'
-        trace('start-reject', { name, reason: 'no-profile' })
+      // ① **先定数据面，再拼 profile 路径**（t-012f7abb 的真缺陷在这儿）：
+      // `isolatedHome=true` 的节点 profile 落在它**自己的**数据面下（`<workspace>/.dsh/profiles/<name>`），
+      // 共享 home 里没有它 ⇒ 只按共享 home 拼一条路径会把「数据面不同」误报成「没造过」。
+      const mainHome = homeOf()
+      const root = nodesRootOf()
+      const wsHint = str(args.workspace, '').trim() !== '' ? resolve(str(args.workspace)) : ''
+      const candidates = profileDirCandidates({
+        name, mainHome, nodesRoot: root, workspaceHint: wsHint, siblingWorkspaces: subdirs(root),
+      })
+      const profileDir = pickProfileDir(candidates, (p) => existsSync(p))
+      if (profileDir === '') {
+        // 判据③：真没造过 ⇒ **响亮拒绝**并列出探测范围（§5.9 规则 6：读数自带范围标注）
+        const note = 'profile 不存在——这是**没造过**的节点（已探测 ' + String(candidates.length)
+          + ' 处数据面：' + candidates.join(' ｜ ') + '）。要造新节点请用 node_create。'
+        trace('start-reject', { name, reason: 'no-profile', probed: candidates })
         return { ok: false, name, pid: 0, workspace: '', cmd: '', note }
       }
       // 读自描述块：读不到就退回默认规则（**不把「信息缺失」升级成「功能失效」**）
@@ -645,16 +660,25 @@ export function apply(ctx: Context, config: Config): void {
       if (harnessRoot === '') {
         return { ok: false, name, pid: 0, workspace: '', cmd: '', note: '推不出 harnessRoot（argv[1] 形状不符且未配置 config.harnessRoot）' }
       }
-      // 三级回退：显式参数 > profile 自描述 > 本机默认规则
-      const workspace = str(args.workspace, '').trim() !== ''
-        ? resolve(str(args.workspace))
-        : (meta !== undefined && meta.workspace !== '' ? meta.workspace : join(nodesRootOf(), name))
+      // ② 数据面三级真源：自描述块 > **从已定位的 profile 目录反推** > 本实例共享 home。
+      // 中间那一级是本次修复的关键：老 profile（无自描述块）若无此级，会拿共享 home 去起
+      // 一个独立 home 的节点 ⇒ DSH 到它自己的 home 里找不到该 profile（症状**又是**「profile 不存在」）。
+      const derivedHome = homeOfProfile(profileDir)
+      const home = meta !== undefined && meta.home !== '' ? meta.home : (derivedHome !== '' ? derivedHome : mainHome)
+      const isolated = derivedHome !== '' && resolve(derivedHome).toLowerCase() !== resolve(mainHome).toLowerCase()
+      // ③ 工作分区四级回退：显式参数 > profile 自描述 > **独立数据面反推**（`<ws>/.dsh` ⇒ `<ws>`）> 默认规则
+      const wsFromHome = isolated ? workspaceOfHome(derivedHome) : ''
+      const workspace = wsHint !== ''
+        ? wsHint
+        : (meta !== undefined && meta.workspace !== ''
+          ? meta.workspace
+          : (wsFromHome !== '' ? wsFromHome : join(root, name)))
       const spec: NodeSpec = {
         name,
         template: meta !== undefined && meta.template !== '' ? meta.template : 'web',
         workspace,
         harnessRoot,
-        home: meta !== undefined && meta.home !== '' ? meta.home : homeOf(),
+        home,
         busDir: meta !== undefined && meta.busDir !== '' ? meta.busDir : busDirOf(),
         role: meta?.role ?? '',
         port: num(args.port, meta?.port ?? 0),
@@ -668,14 +692,19 @@ export function apply(ctx: Context, config: Config): void {
         return { ok: false, name, pid: 0, workspace, cmd: '', note: '工作分区不可用：' + String(e) }
       }
       const r = spawnDetached(plan.launch.cmd, plan.launch.cwd, plan.launch.env, join(spec.workspace, '.nodeforge.log'))
-      trace('started', { name, launcherPid: r.pid, orphan: true, fromMeta: meta !== undefined, cmd: plan.launch.cmd.join(' ') })
+      trace('started', {
+        name, launcherPid: r.pid, orphan: true, fromMeta: meta !== undefined,
+        profileDir, home, probed: candidates.length, cmd: plan.launch.cmd.join(' '),
+      })
       return {
         ok: r.ok, name, pid: r.pid, workspace,
         cmd: plan.launch.cmd.join(' '),
         note: (r.ok ? '已**孤儿化**启动。' : '起进程失败：' + String(r.error) + '。')
+          + '定位：profile=' + profileDir + '（数据面=' + home + '，命中第 '
+          + String(candidates.indexOf(profileDir) + 1) + '/' + String(candidates.length) + ' 个候选）。'
           + '元信息来源：' + (meta !== undefined
             ? 'profile 自描述块'
-            : '默认规则（该 profile 无 dshNodeforge 块——可能是手工造的）')
+            : '默认规则 + 数据面反推（该 profile 无 dshNodeforge 块——可能是手工造的）')
           + '。⚠ 返回的 pid 是**启动器**的（它约 150ms 后自灭）——**真节点的 pid 请在一个心跳周期后从 `cluster_nodes` 读**。日志见 ' + join(workspace, '.nodeforge.log'),
       }
     },

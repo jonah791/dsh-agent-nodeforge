@@ -269,6 +269,115 @@ export function readNodeMeta(raw: unknown): NodeMeta | undefined {
   }
 }
 
+// ── profile 定位：**先定数据面，再拼 profile 路径**（t-012f7abb）───────────────────
+// 真缺陷：`isolatedHome=true` 的节点把 profile 落在**自己的数据面**下
+// （`<workspace>/.dsh/profiles/<name>`），而共享 home（`<本实例 DSH_HOME>/profiles/<name>`）
+// 里**没有**它。只按共享 home 拼一条路径 ⇒ 把「数据面不同」误报成「没造过这个节点」。
+// ⚠ 这两件事必须能分开：**本机有没有这个 profile** ≠ **它在不在我这个数据面里**（§5.9 规则 6）。
+
+/** 定位 profile 需要的路径真源（全部由调用方注入 ⇒ 决策可离线测）。 */
+export interface ProfileSearch {
+  /** 节点名（= profile 名）。 */
+  name: string
+  /** 本实例的 `DSH_HOME`（共享数据面）。 */
+  mainHome: string
+  /** 节点工作分区根（独立数据面的默认父目录）。 */
+  nodesRoot: string
+  /** 调用方**显式**给的工作分区（给了就排最前——人给的比规则准）。 */
+  workspaceHint?: string
+  /** `nodesRoot` 下已存在的分区目录名（覆盖「分区目录名 ≠ 节点名」的节点）。 */
+  siblingWorkspaces?: readonly string[]
+}
+
+/**
+ * 列出**将按序探测**的 profile 目录（纯函数：不碰文件系统）。
+ *
+ * 顺序即优先级。**共享 home 排第二**（只在显式提示之后）——既有共享节点永远先命中它，
+ * 于是「共用数据面」那条路径的语义与「只拼共享 home」逐字相同（不变量 N9）。
+ *
+ * 探测面覆盖三种真实布局：① 显式工作分区 `<ws>/.dsh/profiles/<name>`
+ * ② 共享 home `<mainHome>/profiles/<name>` ③ 独立 home 默认布局
+ * `<nodesRoot>/<name>/.dsh/profiles/<name>` ④ 分区目录名 ≠ 节点名的独立 home
+ * `<nodesRoot>/<其它分区>/.dsh/profiles/<name>`。
+ * @param q - 路径真源
+ */
+export function profileDirCandidates(q: ProfileSearch): string[] {
+  const raw: string[] = []
+  const hint = (q.workspaceHint ?? '').trim()
+  if (hint !== '') raw.push(joinPath(hint, '.dsh', 'profiles', q.name))
+  raw.push(joinPath(q.mainHome, 'profiles', q.name))
+  raw.push(joinPath(q.nodesRoot, q.name, '.dsh', 'profiles', q.name))
+  for (const w of q.siblingWorkspaces ?? []) {
+    if (w.trim() === '') continue
+    raw.push(joinPath(q.nodesRoot, w, '.dsh', 'profiles', q.name))
+  }
+  // 去重（保序）：Windows 下大小写不同 = 同一处；`nodesRoot` 落在 home 的父目录时两者也会重合。
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const p of raw) {
+    const key = p.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(p)
+  }
+  return out
+}
+
+/**
+ * 候选里**第一个存在**的即 profile 目录（`exists` 由调用方注入 ⇒ 决策可离线测）。
+ * @param candidates - `profileDirCandidates` 的有序候选
+ * @param exists - 「这个路径在不在盘上」的判据（壳层传 `existsSync`）
+ * @returns 命中路径；一个都不存在 ⇒ 空串（= 真的**没造过**）
+ */
+export function pickProfileDir(candidates: readonly string[], exists: (p: string) => boolean): string {
+  for (const c of candidates) if (exists(c)) return c
+  return ''
+}
+
+/** 纯字符串「取父目录」（不依赖平台的 path 模块——分隔符由字符串自己体现）。 */
+const parentOf = (p: string): string => {
+  const t = p.replace(/[\\/]+$/, '')
+  const i = Math.max(t.lastIndexOf('\\'), t.lastIndexOf('/'))
+  return i <= 0 ? '' : t.slice(0, i)
+}
+
+/** 纯字符串「取末段名」。 */
+const baseNameOf = (p: string): string => {
+  const t = p.replace(/[\\/]+$/, '')
+  const i = Math.max(t.lastIndexOf('\\'), t.lastIndexOf('/'))
+  return i < 0 ? t : t.slice(i + 1)
+}
+
+/**
+ * 由**已定位的 profile 目录**反推它所在的数据面：`<home>/profiles/<name>` ⇒ `<home>`。
+ *
+ * **为什么必须反推**：老 profile 没有 `dshNodeforge` 块 ⇒ 元信息只能退回默认规则，
+ * 而默认规则里的 `home` 是**本实例的**共享 home——拿它去起一个独立 home 的节点，
+ * DSH 会到它自己的 home 里找该 profile（找不到）⇒ 症状**又是**「profile 不存在」。
+ * 判据是目录形状（**profile 在哪儿，数据面就在哪儿**），不靠调用方记忆。
+ * @param profileDir - 已命中的 profile 目录
+ * @returns 形状不符（父目录名不是 `profiles`）⇒ 空串——**退回默认规则，不猜**
+ */
+export function homeOfProfile(profileDir: string): string {
+  const profilesDir = parentOf(profileDir)
+  if (baseNameOf(profilesDir).toLowerCase() !== 'profiles') return ''
+  return parentOf(profilesDir)
+}
+
+/**
+ * 从**隔离数据面**反推工作分区：`<workspace>/.dsh` ⇒ `<workspace>`。
+ *
+ * ⚠ 共享 home（`~/.dsh`）同样是 `.dsh` 结尾 ⇒ 调用方**必须先判定它是隔离数据面**
+ * （≠ 本实例 home）再用；否则会把共享节点的工作分区算成 home 的父目录，
+ * 那是对「共用数据面」路径的行为回退（N9 要防的正是这个）。
+ * @param home - 数据面绝对路径
+ * @returns 末段不是 `.dsh` ⇒ 空串（形状不符不猜）
+ */
+export function workspaceOfHome(home: string): string {
+  const t = home.replace(/[\\/]+$/, '')
+  return baseNameOf(t).toLowerCase() === '.dsh' ? parentOf(t) : ''
+}
+
 /**
  * 本机节点全貌里的一条（`node_list` 用）。
  * @param name - profile 名

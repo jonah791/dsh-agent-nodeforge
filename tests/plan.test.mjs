@@ -11,7 +11,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import {
-  SHIPPED_PROFILES, TEMPLATE_BUNDLES, describeNodeRow, planNode, readNodeMeta, stopGuard, validateNodeName, yamlQuote,
+  SHIPPED_PROFILES, TEMPLATE_BUNDLES, describeNodeRow, homeOfProfile, pickProfileDir, planNode,
+  profileDirCandidates, readNodeMeta, stopGuard, validateNodeName, workspaceOfHome, yamlQuote,
 } from '../lib/plan.js'
 
 const require = createRequire(import.meta.url)
@@ -253,4 +254,107 @@ test('readNodeMeta：缺字段用安全默认（空串 / 0 / false），**不伪
   assert.equal(m.workspace, '', '缺 workspace 应是空串——伪造一个默认路径会让 node_start 起错地方')
   assert.equal(m.port, 0)
   assert.equal(m.autoInject, false)
+})
+
+// ── profile 定位：**先定数据面，再拼 profile 路径**（t-012f7abb 的判据①/②/③）──────
+// 缺陷形态：`node_start` 原先只拼一条 `<本实例 DSH_HOME>/profiles/<name>`，
+// 而 `isolatedHome=true` 的节点 profile 落在它**自己的**数据面下 ⇒ 明明存在的节点被判「没造过」。
+//
+// ⚠ **本组是纯决策层判据，全程不碰真盘**：`exists` 是注入的谓词（夹具替身），
+// 所以它既不读生产资产、也不依赖运行平台（路径只作字符串处理）。
+// 真机上「哪条候选真的存在」由 `node_start` 的线上验收（§7 A16）负责。
+
+/** 本机真实布局的替身（2026-09-26 取证：nodesRoot=E:\alice-nodes，主 home=E:\alice\.dsh）。 */
+const MAIN_HOME = 'E:\\alice\\.dsh'
+const NODES_ROOT = 'E:\\alice-nodes'
+const ISO_PROFILE = 'E:\\alice-nodes\\node-a\\.dsh\\profiles\\node-a'
+const SHARED_PROFILE = 'E:\\alice\\.dsh\\profiles\\passbook-scratch'
+
+/** 造一个「盘上只有这些路径」的谓词（大小写不敏感，Windows 语义）。 */
+const diskOf = (...paths) => {
+  const set = new Set(paths.map((p) => p.toLowerCase()))
+  return (p) => set.has(p.toLowerCase())
+}
+
+test('profileDirCandidates：共用数据面永远先命中共享 home（N9：不为修独立 home 而改共享语义）', () => {
+  const c = profileDirCandidates({ name: 'passbook-scratch', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT })
+  assert.equal(c[0], SHARED_PROFILE, '共享 home 必须是「无显式提示」时的第一候选')
+})
+
+test('profileDirCandidates：独立 home 的默认布局在候选里（含「分区目录名 ≠ 节点名」）', () => {
+  const c = profileDirCandidates({
+    name: 'node-a', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, siblingWorkspaces: ['node-a', 'node-b', 'maid-01'],
+  })
+  assert.ok(c.includes(ISO_PROFILE), '缺少独立 home 默认布局：' + c.join(' | '))
+  assert.ok(c.includes('E:\\alice-nodes\\maid-01\\.dsh\\profiles\\node-a'),
+    '缺少「分区目录名 ≠ 节点名」的探测面：' + c.join(' | '))
+  assert.equal(new Set(c.map((x) => x.toLowerCase())).size, c.length, '候选不得重复：' + c.join(' | '))
+})
+
+test('profileDirCandidates：显式 workspace 提示排最前（人给的比规则准）', () => {
+  const c = profileDirCandidates({
+    name: 'node-a', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, workspaceHint: 'D:\\ws\\x',
+  })
+  assert.equal(c[0], 'D:\\ws\\x\\.dsh\\profiles\\node-a')
+})
+
+test('判据①：isolatedHome=true 的节点——共享 home 没有它，仍能在**它自己的数据面**里定位', () => {
+  const exists = diskOf(ISO_PROFILE) // 盘上只有独立数据面这一份
+  const c = profileDirCandidates({
+    name: 'node-a', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, siblingWorkspaces: ['node-a', 'node-b'],
+  })
+  const hit = pickProfileDir(c, exists)
+  assert.equal(hit, ISO_PROFILE, '隔离 home 的节点应被定位到：' + c.join(' | '))
+  // 数据面必须**从命中的 profile 目录反推**，不能回落到共享 home
+  // （回落 = DSH 到自己的 home 里找不到该 profile ⇒ 症状又是「profile 不存在」）
+  assert.equal(homeOfProfile(hit), 'E:\\alice-nodes\\node-a\\.dsh')
+  assert.equal(workspaceOfHome(homeOfProfile(hit)), 'E:\\alice-nodes\\node-a')
+  // **尸体样本**：旧算法（只拼共享 home 一条候选）在同一盘面上判「没造过」——
+  // 这一条证明本判据有区分力（不是恒绿的装饰）。
+  assert.equal(pickProfileDir([MAIN_HOME + '\\profiles\\node-a'], exists), '')
+})
+
+test('判据②：共用数据面的节点行为不变——仍命中共享 home，且反推回同一个 home', () => {
+  const exists = diskOf(SHARED_PROFILE)
+  const c = profileDirCandidates({
+    name: 'passbook-scratch', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, siblingWorkspaces: ['node-a'],
+  })
+  assert.equal(pickProfileDir(c, exists), SHARED_PROFILE)
+  const derived = homeOfProfile(SHARED_PROFILE)
+  assert.equal(derived.toLowerCase(), MAIN_HOME.toLowerCase(),
+    '共享 profile 反推出的 home 必须**等于**本实例 home ⇒ 调用方的 isolated 判定为 false')
+  // 陷阱自证：`workspaceOfHome(共享 home)` 非空（`~/.dsh` 同样是 `.dsh` 结尾）——
+  // 所以「反推工作分区」这一级**只能在 isolated 为真时启用**（index.ts 已按此接线）。
+  assert.equal(workspaceOfHome(MAIN_HOME), 'E:\\alice')
+})
+
+test('判据③：真不存在的名字 ⇒ 一个候选都不命中（返回空串，由调用方响亮拒绝）', () => {
+  const c = profileDirCandidates({
+    name: 'never-forged-node', mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, siblingWorkspaces: ['node-a', 'node-b'],
+  })
+  assert.ok(c.length >= 3, '应探测多处数据面（读数要自带范围）：' + c.join(' | '))
+  assert.equal(pickProfileDir(c, () => false), '', '全不存在必须得空串——不能返回一个「看起来像」的路径')
+  // 对照组：同一个候选列表喂「存在谓词」时必须命中——否则上面那条恒为空、没有区分力。
+  assert.equal(pickProfileDir(c, () => true), c[0])
+})
+
+test('homeOfProfile / workspaceOfHome：形状不符 ⇒ 空串（**不猜**）', () => {
+  for (const bad of ['', 'node-a', 'E:\\alice\\profiles', 'E:\\alice\\dsh\\profiles-x\\node-a']) {
+    assert.equal(homeOfProfile(bad), '', '不该从这种形状推数据面：' + bad)
+  }
+  for (const bad of ['', 'E:\\x\\dsh', 'E:\\alice-nodes\\node-a']) {
+    assert.equal(workspaceOfHome(bad), '', '不该从这种形状推工作分区：' + bad)
+  }
+  // 混合分隔符（跨平台路径串）也应能识别形状
+  assert.equal(homeOfProfile('E:\\alice-nodes/node-a/.dsh/profiles/node-a'), 'E:\\alice-nodes/node-a/.dsh')
+})
+
+test('定位与落盘同一真源：node_create 写 profile 的目录 == 同 spec 下 node_start 的首个候选', () => {
+  // 防的是「写在一处、找在另一处」——两处若漂移，本判据先红。
+  const spec = mkSpec({ home: 'E:\\alice-nodes\\node-a\\.dsh', workspace: 'E:\\alice-nodes\\node-a' })
+  const written = planNode(spec).files[0].path.replace(/[\\/][^\\/]+$/, '')
+  const c = profileDirCandidates({
+    name: spec.name, mainHome: MAIN_HOME, nodesRoot: NODES_ROOT, workspaceHint: spec.workspace,
+  })
+  assert.equal(c[0].toLowerCase(), written.toLowerCase(), '定位候选与落盘目录必须同源：' + c[0] + ' vs ' + written)
 })
