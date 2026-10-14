@@ -15,7 +15,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { execFile, spawn } from 'node:child_process'
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, hostname as osHostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,6 +24,11 @@ import {
   validateNodeName, workspaceOfHome,
   SHIPPED_PROFILES, TEMPLATE_BUNDLES, type NodeRow, type NodeSpec,
 } from './plan.ts'
+import {
+  buildRoster, renderRoster, judgeRetire, matchMember, DEFAULT_ACTION_TAIL, MANOR_HARNESS,
+  toolsForRole,
+  type HeartbeatFacts, type RosterReport,
+} from './roster.ts'
 
 export const name = 'agent-nodeforge'
 export const inject = ['tools'] as const
@@ -44,6 +49,14 @@ export interface Config {
   clusterPluginPath: string
   /** 装依赖超时（ms）。 */
   installTimeoutMs: number
+  /**
+   * **角色**（`E3` 裁决落地 · 2026-10-14）：`member` ⇒ 工具面收窄到 `MEMBER_TOOLS`
+   * （白名单 · fail-closed）；其余值（含缺省 `host`）⇒ **全部**。
+   * ⚠ 与 `dsh-manor` 的 `role` **同一语义、同一缺省方向** —— 修前本插件**没有这个字段**，
+   *   而它的 `config.role` 是**名册标签**（`plan.ts` 的 `spec.role`），不是权限开关 ⇒
+   *   同名不同义是这条缺口的一部分。
+   */
+  role: string
 }
 
 export const Config = z.object({
@@ -54,11 +67,16 @@ export const Config = z.object({
   harnessRoot: z.string().default(''),
   clusterPluginPath: z.string().default(''),
   installTimeoutMs: z.number().default(120_000),
+  role: z.string().default('host'),
 })
 
 /** 工具参数（宽松形状：`parameters` 只做展示与提示，取值自己校验）。 */
 interface ToolArgs {
   name?: unknown
+  id?: unknown
+  apply?: unknown
+  includeMembers?: unknown
+  withState?: unknown
   template?: unknown
   workspace?: unknown
   port?: unknown
@@ -67,6 +85,8 @@ interface ToolArgs {
   autoInject?: unknown
   dryRun?: unknown
   start?: unknown
+  busDir?: unknown
+  tailActions?: unknown
 }
 
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback)
@@ -750,12 +770,309 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  // ── 工具五：manor_roster（庄园名册）──────────────────────────────────────────
+  /** `manor_roster` 的返回形状（`output.schema` 严格校验 ⇒ 字段必须齐全）。 */
+  interface RosterToolResult {
+    ok: boolean
+    busDir: string
+    readable: boolean
+    headline: string
+    online: string[]
+    stale: string[]
+    divergences: string[]
+    errors: string[]
+    rendered: string
+  }
+
+  /**
+   * 读盘 + 探活，把**事实**交给纯函数层判定。判据全在 `roster.ts`（可离线测）。
+   *
+   * ⚠ **不起子进程**：成员会话里 `pwsh` 初始化本就失败（庄园语义文档 §9），且 §5.24 要求
+   * spawn 必挂 error——能不 spawn 就绝不 spawn。`process.kill(pid, 0)` 是纯 API，够用。
+   * @param bus - 总线根
+   * @returns 事实清单（`null` = 名册目录读不到，与「空」语义相反）与错误清单
+   */
+  const collectFacts = (bus: string): { facts: HeartbeatFacts[] | null; errors: string[] } => {
+    const dir = join(bus, 'nodes')
+    let names: string[] = []
+    try {
+      names = readdirSync(dir).filter((f) => f.endsWith('.json'))
+    } catch (e) {
+      return { facts: null, errors: ['读 nodes 目录失败：' + String(e)] }
+    }
+    const facts: HeartbeatFacts[] = []
+    for (const f of names) {
+      const id = f.replace(/\.json$/, '')
+      let atMs = 0
+      let mtimeMs = 0
+      let pid: number | null = null
+      let startedAtMs = 0
+      let role = '-'
+      let harness = '-'
+      let displayName = ''
+      let profile = ''
+      let workdir = ''
+      let capabilities: string[] = []
+      let broken: string | null = null
+      try {
+        mtimeMs = statSync(join(dir, f)).mtimeMs
+      } catch {
+        mtimeMs = 0
+      }
+      try {
+        const raw = JSON.parse(readFileSync(join(dir, f), 'utf8')) as Record<string, unknown>
+        atMs = typeof raw['atMs'] === 'number' ? raw['atMs'] : 0
+        pid = typeof raw['pid'] === 'number' ? raw['pid'] : null
+        startedAtMs = typeof raw['startedAtMs'] === 'number' ? raw['startedAtMs'] : 0
+        role = typeof raw['role'] === 'string' ? raw['role'] : '-'
+        harness = typeof raw['harness'] === 'string' ? raw['harness'] : '-'
+        displayName = typeof raw['displayName'] === 'string' ? raw['displayName'] : ''
+        profile = typeof raw['profile'] === 'string' ? raw['profile'] : ''
+        workdir = typeof raw['workdir'] === 'string' ? raw['workdir'] : ''
+        const caps = raw['capabilities']
+        capabilities = Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string') : []
+      } catch (e) {
+        broken = String(e)
+      }
+      facts.push({
+        id, atMs, mtimeMs, pid,
+        pidAlive: pid === null ? null : pidAlive(pid),
+        startedAtMs, role, harness, displayName, profile, workdir, capabilities, broken,
+        aliases: profile !== '' ? [profile] : [],
+      })
+    }
+    return { facts, errors: [] }
+  }
+
+  const readTextSafe = (p: string): string | null => {
+    try {
+      return readFileSync(p, 'utf8')
+    } catch {
+      return null
+    }
+  }
+
+  const rosterTool: ToolDefinition = defineTool({
+    name: 'manor_roster',
+    description:
+      '庄园名册：一眼看清**谁在、什么角色、是不是真的活着**。'
+      + '**多源核验**——自报心跳 `atMs` · 心跳文件 `mtime` · `pid` 探活，源间分歧显式报出。'
+      + '（为什么必须多源：2026-10-06 实测，单一真源的判据把三个已连跑 26 小时的成员报成「未运行」，'
+      + '根因是它只按 cluster 的 `‹host›-‹profile›` 命名规则匹配，而庄园适配器用裸 id 注册。）'
+      + '名册读不到时**响亮报错**，不静默当成「没有成员上线过」——「空」与「读不到」是两件事。'
+      + '只读、零副作用、**不起子进程**（成员会话里 pwsh 会失败）。',
+    parameters: {
+      busDir: { type: 'string', description: '总线根（缺省用插件配置，再退回 ~/.dsh-cluster）' },
+      tailActions: { type: 'number', description: '动作日志清点上限（缺省 ' + String(DEFAULT_ACTION_TAIL) + '）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          busDir: { type: 'string', required: true },
+          readable: { type: 'boolean', required: true },
+          headline: { type: 'string', required: true },
+          online: { type: 'array', required: true, items: { type: 'string' } },
+          stale: { type: 'array', required: true, items: { type: 'string' } },
+          divergences: { type: 'array', required: true, items: { type: 'string' } },
+          errors: { type: 'array', required: true, items: { type: 'string' } },
+          rendered: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value: any) => [{ type: 'text', text: String((value as Record<string, unknown>)['rendered']) }],
+    },
+    async execute(args: ToolArgs): Promise<RosterToolResult> {
+      const rawBus = str(args.busDir, '').trim()
+      const bus = rawBus !== '' ? resolve(rawBus) : busDirOf()
+      const tail = Math.max(1, Math.round(num(args.tailActions, DEFAULT_ACTION_TAIL)))
+      const col = collectFacts(bus)
+      const ctxText = readTextSafe(join(bus, 'context', 'org-context.jsonl'))
+      const actDir = join(bus, 'logs', 'actions')
+      let actNames: string[] = []
+      try {
+        actNames = readdirSync(actDir).filter((f) => f.endsWith('.jsonl')).slice(-tail)
+      } catch {
+        actNames = []
+      }
+      const report: RosterReport = buildRoster({
+        busDir: bus,
+        nowMs: Date.now(),
+        heartbeats: col.facts,
+        contextText: ctxText,
+        actionFiles: actNames.map((n) => ({ name: n, text: readTextSafe(join(actDir, n)) })),
+        errors: col.errors,
+      })
+      trace('manor-roster', {
+        busDir: bus, readable: report.readable,
+        total: report.counts.total, online: report.counts.online, stale: report.counts.stale,
+      })
+      const broken = report.members.filter((m) => m.state === 'broken').map((m) => m.id + ' 心跳文件损坏')
+      return {
+        ok: report.ok,
+        busDir: bus,
+        readable: report.readable,
+        headline: report.readable
+          ? '成员 ' + String(report.counts.total) + ' · 在线 ' + String(report.counts.online) + ' · 陈旧 ' + String(report.counts.stale)
+          : '名册读不到',
+        online: report.members.filter((m) => m.state === 'online').map((m) => m.id),
+        stale: report.members.filter((m) => m.state !== 'online').map((m) => m.id),
+        divergences: report.members.flatMap((m) => m.divergences.map((d) => m.id + ' · ' + d)),
+        errors: report.errors.concat(broken),
+        rendered: renderRoster(report),
+      }
+    },
+  })
+
+  // ── 工具六：node_retire ────────────────────────────────────────────────────
+  //
+  // 只增不减的设施补「减」的一半（2026-10-10 主人问「没有工具清理退役机制吗」）：
+  // 名册能判 online/stale/broken，却**没有任何清理动作** ⇒ 一次性测试节点（sim-node-a 26 天、
+  // wb-0 25 天…）永久占位，「陈旧」这个信号永远亮着，变成噪音。
+  // 补的不是「一键清空」，是**逐条可审的退役**：缺省干跑、不给 id 只列候选、只移不删。
+  const retireTool: ToolDefinition = defineTool({
+    name: 'node_retire',
+    description:
+      '把**已离线**的节点从名册里退役（名册条目与状态文件**移入** `_retired/`，**只移不删**，可手工搬回）。'
+      + '**缺省干跑**（apply=false 只报将动什么）；**不给 id = 只列候选**（只读，逐条给出放行/拒绝与理由）。'
+      + '三条硬拒绝：找不到的不清（不猜历史）、**在线的不清**（退役的是痕迹不是活体）、'
+      + '**庄园成员不清**（harness=alice-manor-adapter；离线是成员的形态，要退役成员须显式 includeMembers=true）。',
+    parameters: {
+      id: { type: 'string', description: '要退役的节点 id（缺省 = 只列候选，不做任何事）' },
+      apply: { type: 'boolean', description: 'true 才真的移动；缺省 false = 干跑' },
+      includeMembers: { type: 'boolean', description: '显式允许退役庄园成员（缺省 false）' },
+      withState: { type: 'boolean', description: '是否连 state/<id>*.json 一起移（缺省 true）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          applied: { type: 'boolean', required: true },
+          moved: { type: 'array', required: true, items: { type: 'string' } },
+          candidates: { type: 'array', required: true, items: { type: 'string' } },
+          refused: { type: 'array', required: true, items: { type: 'string' } },
+          warnings: { type: 'array', required: true, items: { type: 'string' } },
+          note: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value: any) => {
+        const v = value as Record<string, unknown>
+        const lines: string[] = []
+        lines.push((v['applied'] === true ? '已执行' : '未改动') + ' · ' + String(v['note']))
+        const cand = (v['candidates'] ?? []) as string[]
+        if (cand.length > 0) { lines.push('可退役：'); for (const c of cand) lines.push('  · ' + c) }
+        const ref = (v['refused'] ?? []) as string[]
+        if (ref.length > 0) { lines.push('被拒：'); for (const r of ref) lines.push('  · ' + r) }
+        const moved = (v['moved'] ?? []) as string[]
+        if (moved.length > 0) { lines.push('文件：'); for (const m of moved) lines.push('  → ' + m) }
+        for (const w of ((v['warnings'] ?? []) as string[])) lines.push('  ⚠ ' + w)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(args: ToolArgs) {
+      const bus = busDirOf()
+      const wantId = str(args.id, '').trim()
+      const apply = args.apply === true
+      const includeMembers = args.includeMembers === true
+      const withState = args.withState !== false
+      const col = collectFacts(bus)
+      if (col.facts === null) {
+        return {
+          ok: false, applied: false, moved: [], candidates: [], refused: [], warnings: [],
+          note: '名册读不到（' + col.errors.join('; ') + '）——不猜。',
+        }
+      }
+      const nowMs = Date.now()
+      const verdictOf = (f: HeartbeatFacts | null, id: string) =>
+        judgeRetire({ id, facts: f, nowMs, includeMembers })
+
+      // 不给 id：只列候选（只读，按心跳从旧到新排，最该清的在前）
+      if (wantId === '') {
+        const cands: string[] = []
+        const refs: string[] = []
+        for (const f of col.facts.slice().sort((a, b) => a.atMs - b.atMs)) {
+          const v = verdictOf(f, f.id)
+          if (v.ok) cands.push(f.id + ' — ' + v.reason)
+          else refs.push(f.id + ' — ' + v.reason)
+        }
+        trace('retire-list', { total: col.facts.length, candidates: cands.length })
+        return {
+          ok: true, applied: false, moved: [], candidates: cands, refused: refs, warnings: [],
+          note: '共 ' + String(col.facts.length) + ' 个节点：可退役 ' + String(cands.length)
+            + ' · 被拒 ' + String(refs.length) + '（未做任何改动）',
+        }
+      }
+
+      const host = osHostname()
+      const hit = col.facts.find((f) => matchMember(f, wantId, host) !== '') ?? null
+      const v = verdictOf(hit, wantId)
+      if (!v.ok) {
+        trace('retire-refuse', { id: wantId, reason: v.reason })
+        return {
+          ok: false, applied: false, moved: [], candidates: [], refused: [wantId + ' — ' + v.reason],
+          warnings: v.warnings, note: '拒绝，未做任何事。',
+        }
+      }
+
+      const f = hit as HeartbeatFacts
+      const retiredRoot = join(bus, '_retired')
+      const plan: { from: string; to: string }[] = []
+      plan.push({ from: join(bus, 'nodes', f.id + '.json'), to: join(retiredRoot, 'nodes', f.id + '.json') })
+      if (withState) {
+        let names: string[] = []
+        try {
+          names = readdirSync(join(bus, 'state')).filter((n) => n === f.id + '.json' || n.startsWith(f.id + '.'))
+        } catch {
+          names = []
+        }
+        for (const n of names) plan.push({ from: join(bus, 'state', n), to: join(retiredRoot, 'state', n) })
+      }
+
+      if (!apply) {
+        trace('retire-dry-run', { id: f.id, files: plan.length })
+        return {
+          ok: true, applied: false, moved: plan.map((p) => p.from + '  →  ' + p.to),
+          candidates: [], refused: [], warnings: v.warnings,
+          note: '干跑（apply=false）：将移动 ' + String(plan.length) + ' 个文件，未做改动。',
+        }
+      }
+
+      const moved: string[] = []
+      const errs: string[] = []
+      const stamp = String(nowMs)
+      for (const p of plan) {
+        try {
+          if (!existsSync(p.from)) continue
+          mkdirSync(dirname(p.to), { recursive: true })
+          // 撞名不覆盖：留时间戳后缀（退役是留痕，不是清场）
+          const to = existsSync(p.to) ? p.to + '.' + stamp : p.to
+          renameSync(p.from, to)
+          moved.push(p.from + '  →  ' + to)
+        } catch (e) {
+          errs.push(p.from + '：' + String(e))
+        }
+      }
+      trace('retired', { id: f.id, moved: moved.length, errors: errs.length })
+      return {
+        ok: errs.length === 0, applied: moved.length > 0, moved, candidates: [], refused: [],
+        warnings: v.warnings.concat(errs),
+        note: '已移动 ' + String(moved.length) + ' 个文件到 _retired/（只移不删，可手工搬回）。',
+      }
+    },
+  })
+
   ctx.effect(() => {
     guarded('register', () => {
-      ctx.tools.register(createTool)
-      ctx.tools.register(listTool)
-      ctx.tools.register(stopTool)
-      ctx.tools.register(startTool)
+      // ★★ 2026-10-14 **角色分档**（`E3` 裁决落地）—— 修前这里六个工具**无条件全注册**，
+      //   而 `dsh-manor` 有 `MEMBER_TOOLS` 白名单 ⇒ **同一庄园两套插件给了相反答案**。
+      //   分档表在 `roster.ts` 的 `toolsForRole`（**纯层 · 单一真源**，与 manor 同形同纪律）。
+      //   ⚠ 它**不是安全边界**（成员有 shell 就绕得过），它治的是**同一概念的一致答案**。
+      const all = [createTool, listTool, stopTool, startTool, rosterTool, retireTool]
+      const keep = new Set(toolsForRole(config.role, all.map((t) => t.name)))
+      for (const t of all) if (keep.has(t.name)) ctx.tools.register(t)
     })
     trace('startup', {
       home: homeOf(), busDir: busDirOf(), nodesRoot: nodesRootOf(),
