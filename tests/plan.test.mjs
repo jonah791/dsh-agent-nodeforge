@@ -25,7 +25,7 @@ const mkSpec = (over = {}) => ({
   workspace: 'E:\\alice-nodes\\node-a',
   harnessRoot: 'E:\\alice\\deepseek-harness',
   home: 'E:\\alice\\.dsh',
-  busDir: 'C:\\Users\\tr\\.dsh-cluster',
+  busDir: 'C:\\Users\\demo\\.dsh-cluster',
   role: '执行节点',
   port: 0,
   autoInject: false,
@@ -42,13 +42,13 @@ const fileOf = (plan, suffix) => {
 // ── yamlQuote：本模块最危险的一处（Windows 路径 + YAML 转义） ────────────────────
 
 test('yamlQuote：Windows 路径经真解析后**逐字符保真**（单引号语义）', () => {
-  const p = 'C:\\Users\\tr\\.dsh-cluster'
+  const p = 'C:\\Users\\demo\\.dsh-cluster'
   assert.equal(yaml.load('k: ' + yamlQuote(p) + '\n').k, p)
 })
 
 test('尸体样本：双引号实现下同一路径**会被检出**（抛错或值失真，二者皆算）', () => {
   // 不预设失败形态——高效实现可能抛、也可能静默吃字符，只要「被检出」就说明本套件有区分力。
-  const p = 'C:\\Users\\tr\\.dsh-cluster'
+  const p = 'C:\\Users\\demo\\.dsh-cluster'
   let detected = false
   try {
     const got = yaml.load('k: "' + p + '"\n').k

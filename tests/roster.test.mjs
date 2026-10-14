@@ -136,7 +136,7 @@ test('计数：online / stale / broken 三态分列正确', () => {
 })
 
 test('宽松匹配：裸名 / host 前缀 / 别名 / profile 名都命中', () => {
-  const host = 'LAPTOP-BF4IAPLM'
+  const host = '<host>'
   assert.equal(matchMember(facts({ id: 'maid-01' }), 'maid-01', host), '裸名')
   assert.equal(matchMember(facts({ id: host + '-web-0' }), 'web', host), 'host 前缀')
   assert.equal(matchMember(facts({ id: 'x', profile: 'maid-09' }), 'maid-09', host), 'profile 名')

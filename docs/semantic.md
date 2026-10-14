@@ -94,8 +94,8 @@
 
 | 写法 | 结果 |
 |---|---|
-| `k: 'C:\Users\tr\.dsh-cluster'` | 解析得 `C:\Users\tr\.dsh-cluster` —— **逐字符相等** ✓ |
-| `k: "C:\Users\tr\.dsh-cluster"` | **`YAMLException: expected hexadecimal character`** —— `\U` 被当转义起始，**根本解析不了** |
+| `k: '<home>\.dsh-cluster'` | 解析得 `<home>\.dsh-cluster` —— **逐字符相等** ✓ |
+| `k: "<home>\.dsh-cluster"` | **`YAMLException: expected hexadecimal character`** —— `\U` 被当转义起始，**根本解析不了** |
 
 单引号里只有 `'` 需要翻倍，其余（`\` `"` `#` `:`）全部字面量。
 
@@ -151,7 +151,7 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 | A5 | 所有计划文件都是 `create` 模式（N1） | **单测已验** | ✔ U；**尸体样本**：改成 `overwrite` ⇒ **1 fail** |
 | A6 | 启动形状与守护同形（`--expose-internals` / `--profile` / `--no-open`，`cwd=workspace`） | **单测已验** | ✔ U：逐位置断言 argv + `env.DSH_HOME` + `cwd` |
 | A7 | `stopGuard` 拒绝 web/watch | **单测已验** | ✔ U |
-| A8 | **线上**：`node_create` 起出的节点真的进 `cluster_nodes` 名册 | **已实测**（2026-09-26 21:25） | ✔ E：`node_create name=node-a template=web port=3090` ⇒ 名册出现 `LAPTOP-BF4IAPLM-node-a-3090 [执行节点] · 在线`——**12 天来第一次**名册里有第二个活节点；派生名（`<host>-<profile>-<port>`）与角色都对 |
+| A8 | **线上**：`node_create` 起出的节点真的进 `cluster_nodes` 名册 | **已实测**（2026-09-26 21:25） | ✔ E：`node_create name=node-a template=web port=3090` ⇒ 名册出现 `<host>-node-a-3090 [执行节点] · 在线`——**12 天来第一次**名册里有第二个活节点；派生名（`<host>-<profile>-<port>`）与角色都对 |
 | A9 | **线上**：新节点**无用户会话**时，收到消息落 `hold-no-session`（而非重试到 `dead`） | **已实测**（2026-09-26 21:44） | ✔ E：`node-b`（`autoInject=true` + 零会话）收到 `m-muify6kr-117fc910` ⇒ **恰好 1 条** `hold-no-session`、消息留在 inbox、`attempts={}` / `failed=0` / `dead=0`。与 cluster §7 **E4 是同一次验收** |
 | A10 | 对既有 profile 再锻造一次 ⇒ 拒绝且不改动任何文件 | **待线上验收** | ⚠ 待线上验收（离线只能验计划层，落盘拒绝路径要真跑） |
 | A11 | profile 写入 `dshNodeforge` 自描述块，且 `readNodeMeta` 往返保真 | **单测已验** | ✔ U：字段逐项深度相等 + 往返。**两组尸体样本**：把读侧键名打错（读写不再一致）⇒ **2 fail**；去掉版本校验（`v=2` 也被当合法）⇒ **1 fail** |
@@ -172,7 +172,7 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 | 日期 | 类型 | 内容 |
 |---|---|---|
 | 2026-09-26 | 立项 | 主人指令「创建实例的方法也要配套跟上，最好是借助本地源码安装的 dsh，不同智能体搞个工作分区」。取证链：① 活样本 = 本机两个 DSH 进程的完整命令行（`node --expose-internals <harness>/apps/cli/lib/bin.js --profile web --no-open`）② 官方契约 = `apps/cli/reference/README.zh.md`（`--from-default-profile` 的九条行为）③ 参考实现 = `dsh-agent-watch` 的 spawn（`cwd=workspace`）④ 模板形状 = `$DSH_HOME/profiles/headless/` 四件套 ⑤ 隔离面 = `resolveBusRoot` 注释「总线不落在 DSH_HOME 内」+ `attachment-local` 的 `DSH_HOME → ~/.dsh` 解析链 |
-| 2026-09-26 | **实测（YAML 转义）** | `js-yaml` 真解析对照：单引号写法下 `C:\Users\tr\.dsh-cluster` 逐字符保真；**双引号写法直接 `YAMLException: expected hexadecimal character`**。⇒ `yamlQuote()` 的「别改成双引号」从注释升级为**判据**（配尸体样本） |
+| 2026-09-26 | **实测（YAML 转义）** | `js-yaml` 真解析对照：单引号写法下 `<home>\.dsh-cluster` 逐字符保真；**双引号写法直接 `YAMLException: expected hexadecimal character`**。⇒ `yamlQuote()` 的「别改成双引号」从注释升级为**判据**（配尸体样本） |
 | 2026-09-26 | **踩坑（peer 遮蔽）** | 挂载前必须先立 `pnpm-workspace.yaml` 的 `autoInstallPeers: false`：peer 范围 `^0.1.0-rc.6` **匹配不到**工作区 `0.1.7-rc.x`（semver 预发布规则），pnpm 会从 registry 拉副本遮蔽宿主链接层。与 `dsh-agent-cluster` 同款约定（见 `reports/dsh-升级-0.1.7-rc.2-2026-09-26.md` §4.2） |
 | 2026-09-26 | **流程自纠** | 本插件是先代码后文档（§1 已标注）。补文档时顺带发现：`plan.ts` 的 `matchesProfile` 与 cluster 的 `deriveNodeId` 是**同源规则的两份实现** ⇒ 已在 §8 显式登记同步义务 |
 | 2026-09-26 | **补两个缺口 + 三个实测坑（自圈驱动）** | ① **新工具 `node_start`**：N1 保护让「停掉的节点无法用工具重启」成为真缺口（只能手工起）。② **profile 自描述块 `dshNodeforge`**：把 `template`/`workspace`/`port`/`role`/`busDir`/`home`/`autoInject` 写进 profile 自己的 `package.json`，一并解决「`node_start` 不知道该怎么起」与「`node_list` 报不出真实 workspace」（**U3 由此关闭**）。③ `node_create` 暴露 `autoInject` 参数（原先写死 `false`，导致无法复现「`autoInject=true` 的无会话节点」这一 E4 的目标场景）。**三个坑全是「起得来但秒退」型，症状都像「插件没生效」**：`--no-open` 是 **web 专有**参数（headless 带它 ⇒ `unknown option` 秒退）；**`headless` 是 one-shot 不是常驻**（`dsh: a task is required`）——官方 help 那句 `answer one task, print the result, and exit` 我**读过却没过脑子**；`execFile('pnpm.cmd')` 在 Windows 上 **`spawn EINVAL`**（必须 `shell: true`）。**外加一个猜出来的包名**：sdk 真值是 `dsh-sdk-app`（初版写 `dsh-sdk`）——四个模板的 bundle 包名现已全部实测，并有测试逐字守着。 |
