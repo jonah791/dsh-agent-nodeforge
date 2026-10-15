@@ -7,7 +7,7 @@
 | 版本 | v0.1 |
 | 日期 | 2026-09-26 |
 | 状态 | 实现完成 · **离线已验收 / 线上未验收**（见 §7） |
-| 实现落点 | `src/plan.ts`（纯计划层）· `src/index.ts`（壳：落盘/装依赖/起进程/工具面）· `tests/plan.test.mjs` |
+| 实现落点 | `src/plan.ts`（纯计划层）· `src/roster.ts`（庄园名册纯函数层，零 IO）· `src/index.ts`（壳：落盘/装依赖/起进程/工具面）· `tests/plan.test.mjs` · `tests/roster.test.mjs` |
 | 主副本 | 本文件（`docs/semantic.md`）；无同语义副本 |
 | 设计者 | 爱丽丝（主人 2026-09-26 指令：「创建实例的方法也要配套跟上，最好是借助本地源码安装的 dsh，不同智能体搞个工作分区」） |
 
@@ -159,6 +159,7 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 | A13 | **线上**：`node_start` 能起一个**已存在**的节点 | **已实测**（2026-09-26 21:43） | ✔ E：`node-a` 离线后由 `node_start` 拉起（pid 26468 · 3090 监听 · 名册回在线）。⚠ **同时暴露一个真缺陷**：对**无自描述块**的 profile，`node_start` 会**丢端口** ⇒ 落到 app 默认端口（3080 已被主 web 占）⇒ 进程起来后**立刻死**，症状是「进程起来了但名册里没有」（与 `--no-open` 同族）。**显式传 `port` 即恢复**，已当场验证。见 U6 |
 | A14 | **线上**：数据面默认隔离成立——独立 home 长出 profiles/credentials/storages，主 home 里不再有它，而**通信不受影响** | **已实测**（2026-09-26 22:04） | ✔ E：重建后 `node-a` 的 home `E:\alice-nodes\node-a\.dsh\` 含 `.anonymous-user-id` · `.credentials.yaml` · `profiles/node-a/`（**自带** `node_modules` + `pnpm-lock.yaml`）· `storages/`；主 home 的 `profiles/` **已无 node-a**；两节点仍进名册（`node_list` 每行标出「独立 home」）且仍能收消息（`hold-no-session` **1 条**、消息留在 inbox、`dead/` 空、`attempts` 空） |
 | A15 | **线上**：**孤儿化成立**——节点跨 web 重启存活（生命周期独立于载体） | **已实测**（2026-09-26 22:14） | ✔ E：**两次同样操作的对照**——22:12 重启时两节点是 web 的**直接子进程**（`parent=web`）⇒ **双双被杀**（pid 9072/25420 消失）；实现孤儿化后 22:14 再重启 ⇒ `node-a`(pid 12332，`parent=`**已死**的 18652) 与 `node-b`(pid 6044，`parent=`**已死**的 19216) **双双存活**、3090/3091 仍监听、名册仍在线。机制：`taskkill /T` 沿 `ParentProcessId` 链遍历，经**自灭中间层**转手后链就断（独立对照实验见 `_tmp_orphan/orphan-test.mjs`）。⚠ **范围**：只验了「重启 web」这条**主路径**；`killWeb` 的其它调用路径（L786/L916/L918）未测 |
+| A16 | **线上**：`manor_roster` 在**成员侧**可用，且与主脑读数逐字一致 | **已实测**（2026-10-06 12:38） | ✔ E：maid-01（独立 home、`workspace-write` 沙箱）经庄园适配器收到 `t-roster-accept-1`，**9s / exit=0**，回报 `TOTAL=11` / `ONLINE=<host>-web-0,maid-01,maid-02,maid-03` / `SELF=✓ 在线 · 心跳 3s · pid 27236(活)`；主脑**同刻独立**跑同一工具得同样四个在线 id 与**同一 pid** ⇒ 逐字一致。⚠ **边界**：单次读数；`readable=false`（名册读不到）的**线上**路径未覆盖（离线尸体样本已覆盖）。**附带事实**：成员沙箱是 `workspace-write`（本插件所在宿主是 `danger-full-access`），但那**只限写不限读**，且**插件内 fs IO 不经会话沙箱** ⇒ 她能读工作区外的总线目录 |
 
 ## 8. 与实现的关系
 
@@ -171,6 +172,7 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 
 | 日期 | 类型 | 内容 |
 |---|---|---|
+| 2026-10-06 | **新增第五个工具 `manor_roster`（庄园名册）**（主人指令：「给插件添加一个女仆名单功能」→「其他女仆也要能看到女仆名单」） | **归属理由**：本插件管「节点从哪来、活不活」，「谁在名册里、是不是真的活着」是同一职责的延伸。**核心判据 = 三源交叉核验**：自报 `atMs` · 心跳文件 `mtime` · `pid` 探活（`process.kill(pid,0)`）；**任一源陈旧即降级，并显式报出是哪一源**（`divergences`）。取向：**严格者优先**——宁可把活的报成可疑（可见、可追问），不可把死的报成活（静默、无人知）。**为什么非多源不可（直接动机）**：同日实测本插件原有的 `node_list` 把三个**连跑 26 小时**的成员（maid-01/02/03）报成「未运行」——根因**不是名册读不到**，而是 `matchesProfile` 的**关联判据**：它按 cluster 的 `‹host›-‹profile›[-port]` 规则匹配，而庄园适配器用**裸 id** 注册（`--id maid-01`）⇒ 匹配失败 ⇒ `pid=null` / `rosterNodeId=''` ⇒ 显示成「未运行 · 无名册身份」。⇒ 新工具改用**宽松匹配**（裸名 / host 前缀 / 别名 / profile 名都认）。**新增纯函数层 `src/roster.ts`**（零 IO：`judgeMember` / `buildRoster` / `renderRoster` / `summarizeContext` / `summarizeTasks` / `matchMember`），壳层只负责把盘上事实读成 `HeartbeatFacts`。**⚠ 不改 `node_list` 的现有判据**（那是另一个决策，涉及 cluster 的命名契约），本工具是**并存的新视角**。**测试 32 → 48 条**（新增 15 个，含 **9 具尸体样本**：名册读不到 / 名册为空（与前者语义相反）/ 心跳陈旧 / 三源分歧三种 / 心跳文件损坏 / 时钟回拨）。**线上验收**：挂在 **4 个 profile**（web + maid-01/02/03 各自独立 home）后，同一时刻两个独立进程跑同一工具得**逐字一致**读数（我：在线 4 · `maid-01 心跳 3s pid 27236(活)`；maid-01 自己：`TOTAL=11 / ONLINE=<host>-web-0,maid-01,maid-02,maid-03 / SELF=✓ 在线 · 心跳 3s · pid 27236(活)`），她 9 秒完成。**关键机制事实**：成员的会话沙箱是 `workspace-write`（本 `danger-full-access`），但那**只限制写、不限制读**，且**插件内 fs IO 不经会话沙箱** ⇒ 这是本工具在成员侧可用的前提。**遗留**：`manor_roster` 的**线上**验收未进 §7 表（本轮只做了双端读数一致性，未覆盖「名册读不到」的线上路径——离线已有尸体样本）。 |
 | 2026-09-26 | 立项 | 主人指令「创建实例的方法也要配套跟上，最好是借助本地源码安装的 dsh，不同智能体搞个工作分区」。取证链：① 活样本 = 本机两个 DSH 进程的完整命令行（`node --expose-internals <harness>/apps/cli/lib/bin.js --profile web --no-open`）② 官方契约 = `apps/cli/reference/README.zh.md`（`--from-default-profile` 的九条行为）③ 参考实现 = `dsh-agent-watch` 的 spawn（`cwd=workspace`）④ 模板形状 = `$DSH_HOME/profiles/headless/` 四件套 ⑤ 隔离面 = `resolveBusRoot` 注释「总线不落在 DSH_HOME 内」+ `attachment-local` 的 `DSH_HOME → ~/.dsh` 解析链 |
 | 2026-09-26 | **实测（YAML 转义）** | `js-yaml` 真解析对照：单引号写法下 `<home>\.dsh-cluster` 逐字符保真；**双引号写法直接 `YAMLException: expected hexadecimal character`**。⇒ `yamlQuote()` 的「别改成双引号」从注释升级为**判据**（配尸体样本） |
 | 2026-09-26 | **踩坑（peer 遮蔽）** | 挂载前必须先立 `pnpm-workspace.yaml` 的 `autoInstallPeers: false`：peer 范围 `^0.1.0-rc.6` **匹配不到**工作区 `0.1.7-rc.x`（semver 预发布规则），pnpm 会从 registry 拉副本遮蔽宿主链接层。与 `dsh-agent-cluster` 同款约定（见 `reports/dsh-升级-0.1.7-rc.2-2026-09-26.md` §4.2） |

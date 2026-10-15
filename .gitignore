@@ -1,2 +1,7 @@
 node_modules/
 lib/
+
+*.log
+*.tsbuildinfo
+*.bak
+*.bak-*
