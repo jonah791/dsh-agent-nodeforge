@@ -119,6 +119,7 @@ env = { ...process.env, DSH_HOME: <home>, NODE_USE_ENV_PROXY: '1' }
 | `node_list` | 无 | profile 目录（装配真源）与总线名册（身份真源）对照 |
 | `node_stop` | `name` | 停节点（pid 取自总线心跳）；N4 保护名单 |
 | `node_start` | `name`(必) `port` `workspace` | 起一个**已存在**的节点。`node_create` 有 N1 保护（拒绝覆盖既有 profile）⇒ **停掉之后想再起只能靠它**。参数缺省读自描述块（三级回退：显式参数 > 自描述块 > 默认规则）；**不写任何文件** |
+| `node_retire` | `id`（不给 = 只列候选）· `apply`（缺省 false = 干跑） | 把**已离线**的节点从名册退役：名册条目与状态文件**移入** `_retired/`（**只移不删**，可手工搬回）。三条硬拒绝：找不到的不清（不猜历史）· **在线的不清**（退役的是痕迹不是活体）· 已在 `_retired/` 的不重复移 |
 
 ### 5.5 路径真源（调用点清单）
 
