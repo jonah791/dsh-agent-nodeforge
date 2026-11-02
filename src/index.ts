@@ -438,7 +438,7 @@ export function apply(ctx: Context, config: Config): void {
           await new Promise<void>((res, rej) => {
             // `shell: true` 是 Windows 必需：execFile 直接跑 `.cmd` 会 `spawn EINVAL`
             // （2026-09-26 实测）。参数全是本模块写死的常量，**无注入面**。
-            const child = execFile(pnpm, ['install', '--silent'], { cwd: profileDir, timeout: config.installTimeoutMs, shell: true }, (err) => {
+            const child = execFile(pnpm, ['install', '--silent'], { windowsHide: true, cwd: profileDir, timeout: config.installTimeoutMs, shell: true }, (err) => {
               if (err) rej(err)
               else res()
             })
@@ -754,6 +754,7 @@ export function apply(ctx: Context, config: Config): void {
     if (cmd.length === 0) return { ok: false, pid: 0, error: '空命令' }
     try {
       const child = spawn(process.execPath, [launcher, logPath, '--', ...cmd], {
+        windowsHide: true,
         cwd,
         env: { ...process.env, ...env },
         detached: true,

@@ -37,6 +37,7 @@ try {
 }
 
 const child = spawn(cmd[0], cmd.slice(1), {
+  windowsHide: true,
   cwd: process.cwd(),
   env: process.env,
   detached: true,
