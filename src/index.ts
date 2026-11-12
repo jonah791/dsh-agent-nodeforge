@@ -318,6 +318,7 @@ export function apply(ctx: Context, config: Config): void {
   // ── 工具一：node_create ─────────────────────────────────────────────────────
   const createTool: ToolDefinition = defineTool({
     name: 'node_create',
+    deferLoading: true,
     description:
       '锻造一个 DSH 智能体实例：建工作分区 + 写 profile 骨架（照官方模板逐字段对齐）+ '
       + '写 cluster 配置（共用总线）+ 装 link 依赖 + 起进程。三个隔离层次互相独立——'
@@ -490,6 +491,7 @@ export function apply(ctx: Context, config: Config): void {
   // ── 工具二：node_list ───────────────────────────────────────────────────────
   const listTool: ToolDefinition = defineTool({
     name: 'node_list',
+    deferLoading: true,
     description:
       '列本机节点：profile 目录（装配真源）与总线名册（身份真源）对照。'
       + '答「谁有 profile、谁在名册里、谁真的在线」——包括没有名册身份的孤儿 profile。',
@@ -553,6 +555,7 @@ export function apply(ctx: Context, config: Config): void {
   // ── 工具三：node_stop ───────────────────────────────────────────────────────
   const stopTool: ToolDefinition = defineTool({
     name: 'node_stop',
+    deferLoading: true,
     description:
       '停一个本机节点（pid 取自总线心跳）。**带保护名单**：web（当前载体）与 watch（守护）一律拒绝——'
       + '判据落在候选名上，不依赖调用方自觉。',
@@ -607,6 +610,7 @@ export function apply(ctx: Context, config: Config): void {
   // ── 工具四：node_start ──────────────────────────────────────────────────────
   const startTool: ToolDefinition = defineTool({
     name: 'node_start',
+    deferLoading: true,
     description:
       '起一个**已存在**的节点（profile 已在盘上）。`node_create` 只造新节点且拒绝覆盖既有 profile，'
       + '所以「停掉之后想再起」必须靠这个工具。**先在各个数据面里定位 profile**'
@@ -855,6 +859,7 @@ export function apply(ctx: Context, config: Config): void {
 
   const rosterTool: ToolDefinition = defineTool({
     name: 'manor_roster',
+    deferLoading: true,
     description:
       '庄园名册：一眼看清**谁在、什么角色、是不是真的活着**。'
       + '**多源核验**——自报心跳 `atMs` · 心跳文件 `mtime` · `pid` 探活，源间分歧显式报出。'
@@ -934,6 +939,7 @@ export function apply(ctx: Context, config: Config): void {
   // 补的不是「一键清空」，是**逐条可审的退役**：缺省干跑、不给 id 只列候选、只移不删。
   const retireTool: ToolDefinition = defineTool({
     name: 'node_retire',
+    deferLoading: true,
     description:
       '把**已离线**的节点从名册里退役（名册条目与状态文件**移入** `_retired/`，**只移不删**，可手工搬回）。'
       + '**缺省干跑**（apply=false 只报将动什么）；**不给 id = 只列候选**（只读，逐条给出放行/拒绝与理由）。'
